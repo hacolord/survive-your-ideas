@@ -1,0 +1,1505 @@
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- ============================================================================
+-- [ KHU VỰC 1: DỌN DẸP PHIÊN BẢN CŨ & KHỞI TẠO DỊCH VỤ / HÀM EXECUTOR ]
+-- ============================================================================
+local ENV_KEY = "__AutoFarmHub_Runtime_State__"
+getgenv()[ENV_KEY] = getgenv()[ENV_KEY] or {}
+local Runtime = getgenv()[ENV_KEY]
+
+-- Dừng mọi vòng lặp cũ, ngắt kết nối cũ và xoá GUI cũ nếu chạy lại script
+Runtime.globalRunId = (Runtime.globalRunId or 0) + 1
+Runtime.autoFarmRunId = (Runtime.autoFarmRunId or 0) + 1
+Runtime.lobbyWatcherRunId = (Runtime.lobbyWatcherRunId or 0) + 1
+Runtime.active = false
+
+if type(Runtime.connections) == "table" then
+	for _, conn in ipairs(Runtime.connections) do
+		pcall(function()
+			if conn and conn.Connected then
+				conn:Disconnect()
+			end
+		end)
+	end
+end
+Runtime.connections = {}
+
+local function trackConnection(conn)
+	if conn then
+		table.insert(Runtime.connections, conn)
+	end
+	return conn
+end
+
+if type(Runtime.guis) == "table" then
+	for _, gui in ipairs(Runtime.guis) do
+		pcall(function()
+			if gui and gui.Parent then
+				gui:Destroy()
+			end
+		end)
+	end
+end
+Runtime.guis = {}
+
+local function trackGui(gui)
+	if gui then
+		table.insert(Runtime.guis, gui)
+	end
+	return gui
+end
+
+-- Khai báo các Service cần thiết
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+local VirtualInputManager = pcall(function() return game:GetService("VirtualInputManager") end) and game:GetService("VirtualInputManager")
+
+-- Đường dẫn script raw cho Auto Execute (người dùng điền link raw vào biến bên dưới)
+local SCRIPT_URL = "ĐIỀN_LINK_RAW_CỦA_SCRIPT_NÀY_VÀO_ĐÂY"
+local CONFIG_FOLDER = "AutoFarmHub"
+local CONFIG_FILE = CONFIG_FOLDER .. "/config.json"
+local FLAT_CONFIG_FILE = "AutoFarmHub_config.json"
+local AUTOEXEC_FILE = "autoexec/AutoFarmHub.lua"
+
+-- Hàm thông báo qua Rayfield an toàn
+local function notifyUser(title, content, duration)
+	pcall(function()
+		Rayfield:Notify({
+			Title = tostring(title or "Thông báo"),
+			Content = tostring(content or ""),
+			Duration = duration or 4,
+			Image = nil
+		})
+	end)
+end
+
+-- Kiểm tra tồn tại + bọc pcall cho các hàm riêng của executor
+local function hasExecutorFn(name)
+	return type(getgenv()[name]) == "function" or type(_G[name]) == "function" or type(rawget(_G, name)) == "function" or pcall(function() return typeof(loadstring("return " .. name)()) == "function" end)
+end
+
+local function callExecutorFn(name, ...)
+	local args = { ... }
+	local fn = nil
+	if type(getgenv()[name]) == "function" then
+		fn = getgenv()[name]
+	else
+		local okEval, resEval = pcall(function()
+			local chunk = loadstring("return " .. name)
+			return chunk and chunk() or nil
+		end)
+		if okEval and type(resEval) == "function" then
+			fn = resEval
+		end
+	end
+	if type(fn) ~= "function" then
+		return false, "Executor không hỗ trợ hàm '" .. tostring(name) .. "'"
+	end
+	local okCall, r1, r2 = pcall(function()
+		return fn(table.unpack(args))
+	end)
+	if not okCall then
+		return false, tostring(r1)
+	end
+	return true, r1, r2
+end
+
+-- Lấy parent an toàn cho ScreenGui (ưu tiên gethui, fallback CoreGui)
+local function getSafeGuiParent()
+	if hasExecutorFn("gethui") then
+		local ok, hui = callExecutorFn("gethui")
+		if ok and typeof(hui) == "Instance" then
+			return hui
+		end
+	end
+	return CoreGui
+end
+
+-- ============================================================================
+-- [ KHU VỰC 2: BẢNG CẤU HÌNH TRUNG TÂM (CONFIG), SERIALIZE & ELEMENTS ]
+-- ============================================================================
+local function colorToTable(c3)
+	if typeof(c3) == "Color3" then
+		return {
+			r = math.floor(c3.R * 255 + 0.5),
+			g = math.floor(c3.G * 255 + 0.5),
+			b = math.floor(c3.B * 255 + 0.5)
+		}
+	elseif type(c3) == "table" then
+		return {
+			r = tonumber(c3.r) or 255,
+			g = tonumber(c3.g) or 40,
+			b = tonumber(c3.b) or 40
+		}
+	end
+	return { r = 255, g = 40, b = 40 }
+end
+
+local function tableToColor(tbl)
+	if typeof(tbl) == "Color3" then
+		return tbl
+	end
+	if type(tbl) == "table" then
+		local r = tonumber(tbl.r) or 255
+		local g = tonumber(tbl.g) or 40
+		local b = tonumber(tbl.b) or 40
+		if r <= 1 and g <= 1 and b <= 1 and (r > 0 or g > 0 or b > 0) then
+			return Color3.new(r, g, b)
+		end
+		return Color3.fromRGB(math.clamp(r, 0, 255), math.clamp(g, 0, 255), math.clamp(b, 0, 255))
+	end
+	return Color3.fromRGB(255, 40, 40)
+end
+
+local function vec2ToTable(v2)
+	if typeof(v2) == "Vector2" then
+		return { x = v2.X, y = v2.Y }
+	elseif type(v2) == "table" then
+		return { x = tonumber(v2.x) or 0, y = tonumber(v2.y) or 0 }
+	end
+	return { x = 0, y = 0 }
+end
+
+local function udim2ToTable(u2)
+	if typeof(u2) == "UDim2" then
+		return {
+			xScale = u2.X.Scale,
+			xOffset = u2.X.Offset,
+			yScale = u2.Y.Scale,
+			yOffset = u2.Y.Offset
+		}
+	elseif type(u2) == "table" then
+		return {
+			xScale = tonumber(u2.xScale) or 0,
+			xOffset = tonumber(u2.xOffset) or 22,
+			yScale = tonumber(u2.yScale) or 0,
+			yOffset = tonumber(u2.yOffset) or 22
+		}
+	end
+	return { xScale = 0, xOffset = 22, yScale = 0, yOffset = 22 }
+end
+
+local DEFAULT_CONFIG = {
+	-- Metadata
+	version = "1.1.0",
+	savedAt = 0,
+
+	-- Nhóm A: Tab Auto Farm
+	autoFarm = false,
+	item = "1",
+	detectClick = false,
+	clickCoordsRaw = "380;172",
+	clickX = 380,
+	clickY = 172,
+	textboxText = "",
+
+	-- Nhóm B: Tab Setting
+	autoExecute = false,
+	autoLoad = false,
+
+	-- Nhóm C: Minigui Phát hiện click (màu lưu dạng {r,g,b}, kích thước/vị trí lưu bảng số)
+	lastClickRaw = "",
+	lastClickX = nil,
+	lastClickY = nil,
+	markerSizePx = 22,
+	markerSize = udim2ToTable(UDim2.fromOffset(22, 22)),
+	markerLabelOffset = vec2ToTable(Vector2.new(14, -8)),
+	markerColor = colorToTable(Color3.fromRGB(255, 40, 40)),
+	strokeColor = colorToTable(Color3.fromRGB(255, 255, 255)),
+	strokeThickness = 2,
+	markerDisplayOrder = 10000,
+
+	-- Nhóm D: Các hệ số / giá trị logic đã ghi sẵn
+	MIN_HEIGHT = 250,
+	MAX_HEIGHT = 1250,
+	TELEPORT_INTERVAL = 0.75,
+	LOCK_RADIUS_STUD = 5,
+	DETECT_TIMEOUT = 2.0,
+	POLL_STEP = 0.05,
+	PRE_FILL_DELAY = 0.1,
+	POST_SET_DELAY = 0.05,
+	CLICK_HOLD = 0.05,
+	CHAR_DELAY = 0.02,
+	CLICK_LOOP_DELAY = 0.08,
+	ITEM_KEY_MAP = {
+		["1"] = Enum.KeyCode.One.Name,
+		["2"] = Enum.KeyCode.Two.Name,
+		["3"] = Enum.KeyCode.Three.Name,
+		["4"] = Enum.KeyCode.Four.Name,
+		["5"] = Enum.KeyCode.Five.Name
+	},
+	ITEM_CHECK_INTERVAL = 1.0,
+	RETURN_ON_STOP = true,
+	LOBBY_CLICK_X = 328,
+	LOBBY_CLICK_Y = 265,
+	LOBBY_CLICK_INTERVAL = 5.0,
+	LOBBY_MAX_CLICKS = 3,
+	SERVER_POLL_INTERVAL = 0.5
+}
+
+local function deepCopy(orig)
+	if type(orig) ~= "table" then
+		return orig
+	end
+	local copy = {}
+	for k, v in pairs(orig) do
+		copy[k] = deepCopy(v)
+	end
+	return copy
+end
+
+-- Bảng Config trung tâm (nguồn sự thật duy nhất)
+local Config = deepCopy(DEFAULT_CONFIG)
+
+-- Bảng lưu các phần tử Rayfield để Load gọi :Set đúng chỗ
+local Elements = {}
+
+-- Cờ chống callback chạy sai/chạy đôi khi đang Load
+local isLoading = false
+
+-- Chuẩn hoá và nạp dữ liệu từ bảng đã decode vào Config (giữ mặc định nếu thiếu, bỏ qua key lạ)
+local function mergeConfigFromDecoded(decoded)
+	if type(decoded) ~= "table" then
+		return
+	end
+
+	for key, defaultVal in pairs(DEFAULT_CONFIG) do
+		local rawVal = decoded[key]
+		if rawVal ~= nil then
+			if type(defaultVal) == "boolean" then
+				if type(rawVal) == "boolean" then
+					Config[key] = rawVal
+				end
+			elseif type(defaultVal) == "number" then
+				local num = tonumber(rawVal)
+				if num then
+					Config[key] = num
+				end
+			elseif type(defaultVal) == "string" then
+				if type(rawVal) == "string" or type(rawVal) == "number" then
+					Config[key] = tostring(rawVal)
+				end
+			elseif type(defaultVal) == "table" then
+				if key == "markerColor" or key == "strokeColor" then
+					Config[key] = colorToTable(rawVal)
+				elseif key == "markerSize" then
+					Config[key] = udim2ToTable(rawVal)
+				elseif key == "markerLabelOffset" then
+					Config[key] = vec2ToTable(rawVal)
+				elseif key == "ITEM_KEY_MAP" and type(rawVal) == "table" then
+					local mapCopy = deepCopy(defaultVal)
+					for kMap, vMap in pairs(rawVal) do
+						local sKey = tostring(kMap)
+						if mapCopy[sKey] ~= nil and (type(vMap) == "string" or typeof(vMap) == "EnumItem") then
+							mapCopy[sKey] = typeof(vMap) == "EnumItem" and vMap.Name or tostring(vMap)
+						end
+					end
+					Config[key] = mapCopy
+				end
+			end
+		end
+	end
+
+	-- Xử lý riêng lastClickX / lastClickY nếu có trong file
+	if decoded.lastClickX ~= nil then
+		Config.lastClickX = tonumber(decoded.lastClickX)
+	end
+	if decoded.lastClickY ~= nil then
+		Config.lastClickY = tonumber(decoded.lastClickY)
+	end
+	if decoded.version ~= nil then
+		Config.version = tostring(decoded.version)
+	end
+	if decoded.savedAt ~= nil then
+		Config.savedAt = tonumber(decoded.savedAt) or Config.savedAt
+	end
+end
+
+-- ============================================================================
+-- [ KHU VỰC 3: CHỜ GAME LOAD & QUẢN LÝ NHÂN VẬT / HUMANOIDROOTPART ]
+-- ============================================================================
+if not game:IsLoaded() then
+	pcall(function()
+		game.Loaded:Wait()
+	end)
+end
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+	Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	LocalPlayer = Players.LocalPlayer
+end
+
+local function getCharacterAndRoot()
+	local char = LocalPlayer.Character
+	if not char or not char.Parent then
+		return nil, nil, nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp or not hrp:IsA("BasePart") then
+		return char, hum, nil
+	end
+	return char, hum, hrp
+end
+
+local function ensureCharacterReady()
+	local char = LocalPlayer.Character
+	if not char or not char.Parent then
+		char = LocalPlayer.CharacterAdded:Wait()
+	end
+	local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 10)
+	local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
+	return char, hum, hrp
+end
+
+-- Chờ nhân vật ban đầu sẵn sàng trước khi dựng UI
+ensureCharacterReady()
+
+-- ============================================================================
+-- [ KHU VỰC 3.5: THEO DÕI CHUYỂN ĐỔI ID SERVER & TRẠNG THÁI LOBBY / VÁN GAME ]
+-- ============================================================================
+-- Khi mới bật code: bắt buộc nhận định server hiện tại là server lobby,
+-- đóng băng Auto Farm (kể cả khi bật Auto Farm), tự click toạ độ 328;265 mỗi 5s tối đa 3 lần.
+-- Mỗi khi ID server chuyển đổi (kể cả quay lại server có ID giống server lobby ban đầu):
+-- ghi nhận sự chuyển đổi để đảo trạng thái giữa server lobby và ván game thực sự.
+local function getCurrentServerSignature()
+	local placeIdStr = tostring(game.PlaceId or 0)
+	local jobIdStr = tostring(game.JobId or "")
+	return placeIdStr .. ":" .. jobIdStr
+end
+
+local ServerState = {
+	lastSignature = getCurrentServerSignature(),
+	isLobbyFrozen = true,
+	lobbyClickSessionId = 0,
+	lobbyClicksDone = 0
+}
+
+local function clickAtLobbyCoordsOnce()
+	if not VirtualInputManager then
+		return
+	end
+	local lx = tonumber(Config.LOBBY_CLICK_X) or 328
+	local ly = tonumber(Config.LOBBY_CLICK_Y) or 265
+	local hold = tonumber(Config.CLICK_HOLD) or 0.05
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(lx, ly, 0, true, game, 1)
+		task.wait(hold)
+		VirtualInputManager:SendMouseButtonEvent(lx, ly, 0, false, game, 1)
+	end)
+end
+
+local function startLobbyClickSequence()
+	ServerState.lobbyClickSessionId = (ServerState.lobbyClickSessionId or 0) + 1
+	local mySession = ServerState.lobbyClickSessionId
+	ServerState.lobbyClicksDone = 0
+
+	task.spawn(function()
+		local maxClicks = tonumber(Config.LOBBY_MAX_CLICKS) or 3
+		local interval = tonumber(Config.LOBBY_CLICK_INTERVAL) or 5.0
+
+		while ServerState.isLobbyFrozen and ServerState.lobbyClickSessionId == mySession and ServerState.lobbyClicksDone < maxClicks do
+			clickAtLobbyCoordsOnce()
+			ServerState.lobbyClicksDone += 1
+
+			if ServerState.lobbyClicksDone >= maxClicks or not ServerState.isLobbyFrozen or ServerState.lobbyClickSessionId ~= mySession then
+				break
+			end
+
+			local elapsed = 0
+			while elapsed < interval do
+				if not ServerState.isLobbyFrozen or ServerState.lobbyClickSessionId ~= mySession then
+					return
+				end
+				local dt = task.wait(math.min(0.1, interval - elapsed))
+				elapsed += (dt or 0.1)
+			end
+		end
+	end)
+end
+
+local function enterLobbyFrozenState(reasonText)
+	ServerState.isLobbyFrozen = true
+	startLobbyClickSequence()
+	if reasonText then
+		notifyUser("Server Lobby", reasonText, 4)
+	end
+end
+
+local function exitLobbyFrozenState(reasonText)
+	ServerState.isLobbyFrozen = false
+	ServerState.lobbyClickSessionId = (ServerState.lobbyClickSessionId or 0) + 1
+	ServerState.lobbyClicksDone = 0
+	if reasonText then
+		notifyUser("Vào ván game", reasonText, 4)
+	end
+end
+
+local function handleServerIdTransition(newSig)
+	ServerState.lastSignature = newSig
+	if ServerState.isLobbyFrozen then
+		-- Đang ở lobby -> chuyển sang server ván game thực sự: huỷ đóng băng Auto Farm
+		exitLobbyFrozenState("Đã phát hiện chuyển đổi ID server sang ván game. Đã huỷ đóng băng Auto Farm.")
+	else
+		-- Đang ở ván game -> chuyển về lại lobby (kể cả cùng ID server cũ): nhận định là lobby, đóng băng Auto Farm và click lại 3 lần
+		enterLobbyFrozenState("Đã phát hiện chuyển đổi ID server về lobby. Đóng băng Auto Farm và tự click 328;265 mỗi 5s (tối đa 3 lần).")
+	end
+end
+
+-- Khởi động luồng theo dõi chuyển đổi ID server ngay khi script chạy
+do
+	Runtime.lobbyWatcherRunId = (Runtime.lobbyWatcherRunId or 0) + 1
+	local myWatcherId = Runtime.lobbyWatcherRunId
+	ServerState.lastSignature = getCurrentServerSignature()
+	ServerState.isLobbyFrozen = true
+	startLobbyClickSequence()
+
+	task.spawn(function()
+		while Runtime.lobbyWatcherRunId == myWatcherId do
+			local poll = tonumber(Config.SERVER_POLL_INTERVAL) or 0.5
+			task.wait(poll)
+			if Runtime.lobbyWatcherRunId ~= myWatcherId then
+				return
+			end
+			local currentSig = getCurrentServerSignature()
+			if currentSig ~= ServerState.lastSignature then
+				handleServerIdTransition(currentSig)
+			end
+		end
+	end)
+end
+
+-- ============================================================================
+-- [ KHU VỰC 4: LOGIC VẬT PHẨM (HOTBAR 1-5), DỊCH CHUYỂN ĐỘ CAO & CLICK/TEXTBOX ]
+-- ============================================================================
+local rng = Random.new()
+local lastEquippedItem = nil
+local lastItemCheckClock = 0
+
+local function resolveKeyCodeFromItem(itemStr)
+	local keyStr = tostring(itemStr or "1")
+	local mapTable = Config.ITEM_KEY_MAP or DEFAULT_CONFIG.ITEM_KEY_MAP
+	local enumName = mapTable[keyStr]
+	if typeof(enumName) == "EnumItem" then
+		return enumName
+	end
+	if type(enumName) == "string" and Enum.KeyCode[enumName] then
+		return Enum.KeyCode[enumName]
+	end
+	local fallbackMap = {
+		["1"] = Enum.KeyCode.One,
+		["2"] = Enum.KeyCode.Two,
+		["3"] = Enum.KeyCode.Three,
+		["4"] = Enum.KeyCode.Four,
+		["5"] = Enum.KeyCode.Five
+	}
+	return fallbackMap[keyStr] or Enum.KeyCode.One
+end
+
+-- Bấm phím số 1..5 bằng bàn phím ảo (SendKeyEvent) để cầm đồ hotbar, KHÔNG ghi chữ
+local function sendHotbarKeyPress(itemStr)
+	if not VirtualInputManager then
+		return false
+	end
+	local keyCode = resolveKeyCodeFromItem(itemStr)
+	local ok = pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+		task.wait(Config.CLICK_HOLD or 0.05)
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+	return ok
+end
+
+-- Kiểm tra xem nhân vật hiện có đang cầm Tool nào không
+local function hasEquippedTool()
+	local char = LocalPlayer.Character
+	if not char then
+		return false
+	end
+	return char:FindFirstChildOfClass("Tool") ~= nil
+end
+
+-- Xử lý cầm đồ: bấm 1 lần khi bật hoặc khi đổi lựa chọn, sau đó kiểm tra định kỳ ~1s nếu chưa cầm mới bấm lại
+local function syncHotbarSelection(runId, forcePress)
+	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+		return
+	end
+
+	local selectedItem = tostring(Config.item or "1")
+	if lastEquippedItem ~= selectedItem then
+		lastEquippedItem = selectedItem
+		forcePress = true
+	end
+
+	local now = os.clock()
+	if forcePress then
+		sendHotbarKeyPress(selectedItem)
+		lastItemCheckClock = now
+		return
+	end
+
+	if (now - lastItemCheckClock) >= (Config.ITEM_CHECK_INTERVAL or 1.0) then
+		lastItemCheckClock = now
+		if not hasEquippedTool() then
+			sendHotbarKeyPress(selectedItem)
+		end
+	end
+end
+
+-- Dịch chuyển thẳng đứng tới độ cao ngẫu nhiên [MIN_HEIGHT, MAX_HEIGHT] so với originPos.Y, giữ nguyên X và Z, rơi tự do
+local function teleportVerticalStep(originPos, runId)
+	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+		return false
+	end
+	local _, _, hrp = getCharacterAndRoot()
+	if not hrp or not originPos then
+		return false
+	end
+
+	local minH = tonumber(Config.MIN_HEIGHT) or 250
+	local maxH = tonumber(Config.MAX_HEIGHT) or 1250
+	if minH > maxH then
+		minH, maxH = maxH, minH
+	end
+
+	local randomOffsetY = rng:NextNumber(minH, maxH)
+	local targetY = originPos.Y + randomOffsetY
+
+	local ok = pcall(function()
+		hrp.CFrame = CFrame.new(originPos.X, targetY, originPos.Z)
+		hrp.AssemblyLinearVelocity = Vector3.zero
+	end)
+	return ok
+end
+
+-- Dịch chuyển trở lại originPos khi tắt Auto Farm
+local function returnToOrigin(originPos)
+	if not originPos or not Config.RETURN_ON_STOP then
+		return
+	end
+	local _, _, hrp = getCharacterAndRoot()
+	if hrp then
+		pcall(function()
+			hrp.CFrame = CFrame.new(originPos.X, originPos.Y, originPos.Z)
+			hrp.AssemblyLinearVelocity = Vector3.zero
+		end)
+	end
+end
+
+-- ============================================================================
+-- [ KHU VỰC 5: LOGIC PHÁT HIỆN & GHI TEXTBOX (THEO MỤC 4 & CODE THAM CHIẾU) ]
+-- ============================================================================
+local isBusy = false
+
+-- Lấy TextBox đang mở/được chọn (theo code tham chiếu)
+local function getActiveTextBox()
+	local focused = pcall(function() return UserInputService:GetFocusedTextBox() end) and UserInputService:GetFocusedTextBox()
+	if focused and focused:IsA("TextBox") then
+		return focused
+	end
+	if GuiService.SelectedObject and GuiService.SelectedObject:IsA("TextBox") then
+		return GuiService.SelectedObject
+	end
+	return nil
+end
+
+local function isKeyboardOrBoxOpen()
+	if getActiveTextBox() then
+		return true
+	end
+	local kb = pcall(function() return UserInputService.OnScreenKeyboardVisible end) and UserInputService.OnScreenKeyboardVisible
+	return kb == true
+end
+
+local function fillActiveBox(text)
+	local box = getActiveTextBox()
+	if box then
+		pcall(function()
+			box.Text = text
+		end)
+		task.wait(Config.POST_SET_DELAY or 0.05)
+		-- Ghi đè thêm 1 lần nếu game có script reset lại lúc mới focus
+		pcall(function()
+			if box.Text ~= text then
+				box.Text = text
+			end
+			box:ReleaseFocus(true)
+		end)
+		return true
+	end
+
+	-- Dự phòng nếu không bắt được instance TextBox nhưng bàn phím ảo đã mở
+	if VirtualInputManager then
+		for i = 1, #text do
+			local ch = string.sub(text, i, i)
+			pcall(function()
+				VirtualInputManager:SendTextInputCharacterEvent(ch, game)
+			end)
+			task.wait(Config.CHAR_DELAY or 0.02)
+		end
+		return true
+	end
+
+	return false
+end
+
+-- Một lượt click toạ độ (và nếu chuỗi ghi textbox không rỗng thì chờ phát hiện tối đa 2.0s rồi điền)
+local function clickTargetAndTypeOnce(runId)
+	if isBusy then
+		return
+	end
+	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+		return
+	end
+	isBusy = true
+
+	local targetX = tonumber(Config.clickX) or 380
+	local targetY = tonumber(Config.clickY) or 172
+	local textToType = tostring(Config.textboxText or "")
+	local holdTime = Config.CLICK_HOLD or 0.05
+
+	-- 1. Click vào toạ độ đã nhập
+	if VirtualInputManager then
+		pcall(function()
+			VirtualInputManager:SendMouseButtonEvent(targetX, targetY, 0, true, game, 1)
+			task.wait(holdTime)
+			VirtualInputManager:SendMouseButtonEvent(targetX, targetY, 0, false, game, 1)
+		end)
+	end
+
+	-- 2. Nếu ô Ghi textbox không rỗng: chờ tối đa DETECT_TIMEOUT (2.0s) xem TextBox / bàn phím ảo bật lên không
+	if textToType ~= "" then
+		local detected = false
+		local timeout = Config.DETECT_TIMEOUT or 2.0
+		local pollStep = Config.POLL_STEP or 0.05
+		local t0 = os.clock()
+		while (os.clock() - t0) < timeout do
+			if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+				break
+			end
+			if isKeyboardOrBoxOpen() then
+				detected = true
+				break
+			end
+			task.wait(pollStep)
+		end
+
+		-- 3. Nếu phát hiện bật lên thì chờ PRE_FILL_DELAY (0.1s) rồi tự điền chuỗi
+		if detected and Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
+			task.wait(Config.PRE_FILL_DELAY or 0.1)
+			fillActiveBox(textToType)
+		end
+	end
+
+	isBusy = false
+end
+
+-- ============================================================================
+-- [ KHU VỰC 6: ĐIỀU KHIỂN VÒNG LẶP AUTO FARM THEO RUNID ]
+-- ============================================================================
+local currentOriginPos = nil
+
+local function stopAutoFarm()
+	Config.autoFarm = false
+	Runtime.autoFarmRunId = (Runtime.autoFarmRunId or 0) + 1
+	local originToRestore = currentOriginPos
+	currentOriginPos = nil
+	lastEquippedItem = nil
+	isBusy = false
+	if originToRestore then
+		returnToOrigin(originToRestore)
+	end
+end
+
+local function startAutoFarm()
+	Runtime.autoFarmRunId = (Runtime.autoFarmRunId or 0) + 1
+	local myRunId = Runtime.autoFarmRunId
+	Config.autoFarm = true
+	lastEquippedItem = nil
+	lastItemCheckClock = 0
+
+	local _, _, hrp = ensureCharacterReady()
+	if not hrp then
+		Config.autoFarm = false
+		notifyUser("Auto Farm", "Không tìm thấy HumanoidRootPart.", 3)
+		return
+	end
+
+	currentOriginPos = hrp.Position
+
+	-- Nếu đang ở server lobby thì đóng băng Auto Farm (không chạy vòng lặp farm khi đang ở lobby)
+	if ServerState.isLobbyFrozen then
+		notifyUser("Auto Farm", "Đang ở server lobby: Auto Farm bị đóng băng cho tới khi sang server ván game.", 4)
+		return
+	end
+
+	-- Bấm phím chọn đồ 1 lần ngay khi bật Auto Farm
+	syncHotbarSelection(myRunId, true)
+
+	-- Dịch chuyển lên độ cao ngẫu nhiên lần đầu ngay lúc bật
+	teleportVerticalStep(currentOriginPos, myRunId)
+
+	-- Luồng 1: Dịch chuyển độ cao ngẫu nhiên mỗi TELEPORT_INTERVAL (0.75s) + kiểm tra định kỳ cầm đồ
+	task.spawn(function()
+		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
+			local interval = tonumber(Config.TELEPORT_INTERVAL) or 0.75
+			local elapsed = 0
+			while elapsed < interval do
+				if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
+					return
+				end
+				local dt = task.wait(math.min(0.05, interval - elapsed))
+				elapsed += (dt or 0.05)
+			end
+
+			if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
+				return
+			end
+
+			if not ServerState.isLobbyFrozen then
+				-- Đảm bảo có originPos nếu nhân vật vừa respawn
+				local _, _, curHrp = getCharacterAndRoot()
+				if curHrp and not currentOriginPos then
+					currentOriginPos = curHrp.Position
+				end
+
+				syncHotbarSelection(myRunId, false)
+				teleportVerticalStep(currentOriginPos, myRunId)
+			end
+		end
+	end)
+
+	-- Luồng 2: Click toạ độ liên tục + phát hiện/ghi textbox khi Auto Farm bật (và không bị đóng băng ở lobby)
+	task.spawn(function()
+		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
+			if not ServerState.isLobbyFrozen then
+				clickTargetAndTypeOnce(myRunId)
+			end
+			if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
+				return
+			end
+			task.wait(Config.CLICK_LOOP_DELAY or 0.08)
+		end
+	end)
+end
+
+-- Theo dõi respawn để khi bật Auto Farm vẫn giữ originPos hoặc tái đồng bộ khi cần
+trackConnection(LocalPlayer.CharacterAdded:Connect(function()
+	if Config.autoFarm and not ServerState.isLobbyFrozen then
+		lastEquippedItem = nil
+		task.wait(0.2)
+		local _, _, hrp = getCharacterAndRoot()
+		if hrp and not currentOriginPos then
+			currentOriginPos = hrp.Position
+		end
+		syncHotbarSelection(Runtime.autoFarmRunId, true)
+	end
+end))
+
+-- ============================================================================
+-- [ KHU VỰC 7: MINIGUI PHÁT HIỆN CLICK (VÒNG ĐỎ VIỀN TRẮNG, CÙNG HỆ TOẠ ĐỘ) ]
+-- ============================================================================
+local detectGui = nil
+local detectConn = nil
+
+local function destroyDetectClickMiniGui()
+	if detectConn then
+		pcall(function()
+			detectConn:Disconnect()
+		end)
+		detectConn = nil
+	end
+	if detectGui then
+		pcall(function()
+			detectGui:Destroy()
+		end)
+		detectGui = nil
+	end
+end
+
+-- Ghi chú hệ toạ độ:
+-- ScreenGui dùng IgnoreGuiInset = true nên toạ độ màn hình (0,0) là góc trên-trái thực tế của viewport/màn hình,
+-- khớp trực tiếp với toạ độ (x, y) mà VirtualInputManager:SendMouseButtonEvent(x, y, ...) sử dụng.
+-- Nếu cần quy đổi từ toạ độ có inset sang không inset thì trừ GuiService:GetGuiInset(); ở đây cả marker và VIM đều dùng toạ độ màn hình trực tiếp.
+local function createDetectClickMiniGui()
+	destroyDetectClickMiniGui()
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "AutoFarmClickDetectorMiniGui"
+	sg.IgnoreGuiInset = true
+	sg.ResetOnSpawn = false
+	sg.DisplayOrder = tonumber(Config.markerDisplayOrder) or 10000
+	sg.Parent = getSafeGuiParent()
+	detectGui = sg
+	trackGui(sg)
+
+	local sizePx = tonumber(Config.markerSizePx) or 22
+	local circle = Instance.new("Frame")
+	circle.Name = "ClickMarkerCircle"
+	circle.Size = UDim2.fromOffset(sizePx, sizePx)
+	circle.AnchorPoint = Vector2.new(0.5, 0.5)
+	circle.BackgroundColor3 = tableToColor(Config.markerColor)
+	circle.BorderSizePixel = 0
+	circle.Active = false
+	circle.Visible = false
+	circle.Parent = sg
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = circle
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = tableToColor(Config.strokeColor)
+	stroke.Thickness = tonumber(Config.strokeThickness) or 2
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = circle
+
+	local coordLabel = Instance.new("TextLabel")
+	coordLabel.Name = "CoordLabel"
+	coordLabel.Size = UDim2.fromOffset(120, 20)
+	coordLabel.Position = UDim2.new(1, 6, 0.5, -10)
+	coordLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+	coordLabel.BackgroundTransparency = 0.25
+	coordLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	coordLabel.TextStrokeTransparency = 0.3
+	coordLabel.Font = Enum.Font.Code
+	coordLabel.TextSize = 13
+	coordLabel.TextXAlignment = Enum.TextXAlignment.Left
+	coordLabel.Text = ""
+	coordLabel.Active = false
+	coordLabel.Parent = circle
+
+	local function placeMarkerAt(pxX, pxY)
+		local rx = math.floor(tonumber(pxX) or 0 + 0.5)
+		local ry = math.floor(tonumber(pxY) or 0 + 0.5)
+		circle.Position = UDim2.fromOffset(rx, ry)
+		circle.Visible = true
+		coordLabel.Text = string.format(" %d;%d", rx, ry)
+		Config.lastClickX = rx
+		Config.lastClickY = ry
+		Config.lastClickRaw = string.format("%d;%d", rx, ry)
+	end
+
+	-- Nếu đã có toạ độ click gần nhất thì hiển thị lại
+	if Config.lastClickX ~= nil and Config.lastClickY ~= nil then
+		placeMarkerAt(Config.lastClickX, Config.lastClickY)
+	end
+
+	detectConn = trackConnection(UserInputService.InputBegan:Connect(function(input)
+		if not Config.detectClick then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			local pos = input.Position
+			if pos then
+				placeMarkerAt(pos.X, pos.Y)
+			end
+		end
+	end))
+end
+
+-- ============================================================================
+-- [ KHU VỰC 8: BẢNG XÁC NHẬN KIỂU CỔ ĐIỂN (WINDOWS 9X / CLASSIC MODAL) ]
+-- ============================================================================
+local activeClassicModal = nil
+local activeClassicConn = nil
+
+local function closeClassicConfirm()
+	if activeClassicConn then
+		pcall(function()
+			activeClassicConn:Disconnect()
+		end)
+		activeClassicConn = nil
+	end
+	if activeClassicModal then
+		pcall(function()
+			activeClassicModal:Destroy()
+		end)
+		activeClassicModal = nil
+	end
+end
+
+local function showClassicConfirm(title, message, onYes)
+	-- Chỉ hiện 1 bảng tại 1 thời điểm
+	closeClassicConfirm()
+
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "ClassicConfirmModalGui"
+	sg.IgnoreGuiInset = true
+	sg.ResetOnSpawn = false
+	sg.DisplayOrder = 20000
+	sg.Parent = getSafeGuiParent()
+	activeClassicModal = sg
+	trackGui(sg)
+
+	-- Lớp phủ chặn click phía sau
+	local backdrop = Instance.new("TextButton")
+	backdrop.Name = "BackdropBlocker"
+	backdrop.Size = UDim2.fromScale(1, 1)
+	backdrop.Position = UDim2.fromOffset(0, 0)
+	backdrop.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	backdrop.BackgroundTransparency = 0.45
+	backdrop.BorderSizePixel = 0
+	backdrop.Text = ""
+	backdrop.AutoButtonColor = false
+	backdrop.Active = true
+	backdrop.Parent = sg
+
+	-- Khung vuông (không bo góc), nền xám cổ điển RGB(212,208,200)
+	local win = Instance.new("Frame")
+	win.Name = "ClassicWindow"
+	win.Size = UDim2.fromOffset(360, 165)
+	win.Position = UDim2.new(0.5, -180, 0.5, -82)
+	win.BackgroundColor3 = Color3.fromRGB(212, 208, 200)
+	win.BorderSizePixel = 0
+	win.Active = true
+	win.Parent = sg
+
+	-- Viền nổi 3D (trắng + xám đậm)
+	local lightTop = Instance.new("Frame")
+	lightTop.Size = UDim2.new(1, 0, 0, 2)
+	lightTop.Position = UDim2.fromOffset(0, 0)
+	lightTop.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	lightTop.BorderSizePixel = 0
+	lightTop.Parent = win
+
+	local lightLeft = Instance.new("Frame")
+	lightLeft.Size = UDim2.new(0, 2, 1, 0)
+	lightLeft.Position = UDim2.fromOffset(0, 0)
+	lightLeft.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	lightLeft.BorderSizePixel = 0
+	lightLeft.Parent = win
+
+	local darkBottom = Instance.new("Frame")
+	darkBottom.Size = UDim2.new(1, 0, 0, 2)
+	darkBottom.Position = UDim2.new(0, 0, 1, -2)
+	darkBottom.BackgroundColor3 = Color3.fromRGB(128, 128, 128)
+	darkBottom.BorderSizePixel = 0
+	darkBottom.Parent = win
+
+	local darkRight = Instance.new("Frame")
+	darkRight.Size = UDim2.new(0, 2, 1, 0)
+	darkRight.Position = UDim2.new(1, -2, 0, 0)
+	darkRight.BackgroundColor3 = Color3.fromRGB(128, 128, 128)
+	darkRight.BorderSizePixel = 0
+	darkRight.Parent = win
+
+	-- Thanh tiêu đề xanh navy RGB(0,0,128) chữ trắng đậm
+	local titleBar = Instance.new("Frame")
+	titleBar.Name = "TitleBar"
+	titleBar.Size = UDim2.new(1, -8, 0, 24)
+	titleBar.Position = UDim2.fromOffset(4, 4)
+	titleBar.BackgroundColor3 = Color3.fromRGB(0, 0, 128)
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = win
+
+	local titleLbl = Instance.new("TextLabel")
+	titleLbl.Size = UDim2.new(1, -10, 1, 0)
+	titleLbl.Position = UDim2.fromOffset(6, 0)
+	titleLbl.BackgroundTransparency = 1
+	titleLbl.Text = tostring(title or "Xác nhận")
+	titleLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+	titleLbl.Font = Enum.Font.SourceSansBold
+	titleLbl.TextSize = 16
+	titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+	titleLbl.Parent = titleBar
+
+	-- Nội dung câu hỏi
+	local msgLbl = Instance.new("TextLabel")
+	msgLbl.Name = "MessageLabel"
+	msgLbl.Size = UDim2.new(1, -24, 0, 68)
+	msgLbl.Position = UDim2.fromOffset(12, 34)
+	msgLbl.BackgroundTransparency = 1
+	msgLbl.Text = tostring(message or "")
+	msgLbl.TextColor3 = Color3.fromRGB(0, 0, 0)
+	msgLbl.Font = Enum.Font.SourceSans
+	msgLbl.TextSize = 17
+	msgLbl.TextWrapped = true
+	msgLbl.TextXAlignment = Enum.TextXAlignment.Left
+	msgLbl.TextYAlignment = Enum.TextYAlignment.Center
+	msgLbl.Parent = win
+
+	local function makeClassicButton(text, posX, onClickFn)
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.fromOffset(92, 30)
+		btn.Position = UDim2.new(0, posX, 1, -44)
+		btn.BackgroundColor3 = Color3.fromRGB(212, 208, 200)
+		btn.BorderSizePixel = 0
+		btn.Text = text
+		btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+		btn.Font = Enum.Font.SourceSansBold
+		btn.TextSize = 16
+		btn.Parent = win
+
+		local topB = Instance.new("Frame")
+		topB.Size = UDim2.new(1, 0, 0, 2)
+		topB.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+		topB.BorderSizePixel = 0
+		topB.Parent = btn
+
+		local leftB = Instance.new("Frame")
+		leftB.Size = UDim2.new(0, 2, 1, 0)
+		leftB.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+		leftB.BorderSizePixel = 0
+		leftB.Parent = btn
+
+		local botB = Instance.new("Frame")
+		botB.Size = UDim2.new(1, 0, 0, 2)
+		botB.Position = UDim2.new(0, 0, 1, -2)
+		botB.BackgroundColor3 = Color3.fromRGB(128, 128, 128)
+		botB.BorderSizePixel = 0
+		botB.Parent = btn
+
+		local rightB = Instance.new("Frame")
+		rightB.Size = UDim2.new(0, 2, 1, 0)
+		rightB.Position = UDim2.new(1, -2, 0, 0)
+		rightB.BackgroundColor3 = Color3.fromRGB(128, 128, 128)
+		rightB.BorderSizePixel = 0
+		rightB.Parent = btn
+
+		btn.MouseButton1Click:Connect(function()
+			closeClassicConfirm()
+			if type(onClickFn) == "function" then
+				onClickFn()
+			end
+		end)
+		return btn
+	end
+
+	makeClassicButton("Có", 72, onYes)
+	makeClassicButton("Không", 196, nil)
+
+	activeClassicConn = trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if input.KeyCode == Enum.KeyCode.Escape then
+			closeClassicConfirm()
+		end
+	end))
+end
+
+-- ============================================================================
+-- [ KHU VỰC 9: AUTO EXECUTE & SAVE / LOAD CẤU HÌNH ]
+-- ============================================================================
+local function buildAutoExecLoaderCode()
+	return 'loadstring(game:HttpGet("' .. tostring(SCRIPT_URL) .. '"))()'
+end
+
+local function applyAutoExecuteState(enabled)
+	if enabled then
+		if not SCRIPT_URL or SCRIPT_URL == "" or SCRIPT_URL == "ĐIỀN_LINK_RAW_CỦA_SCRIPT_NÀY_VÀO_ĐÂY" then
+			Config.autoExecute = false
+			if Elements.autoExecute then
+				pcall(function() Elements.autoExecute:Set(false) end)
+			end
+			notifyUser("Auto Execute", "Vui lòng điền link raw hợp lệ vào biến SCRIPT_URL ở đầu script trước khi bật.", 5)
+			return false
+		end
+
+		local loaderCode = buildAutoExecLoaderCode()
+		local wroteFile = false
+		if hasExecutorFn("makefolder") then
+			callExecutorFn("makefolder", "autoexec")
+		end
+		if hasExecutorFn("writefile") then
+			local okW, errW = callExecutorFn("writefile", AUTOEXEC_FILE, loaderCode)
+			if okW then
+				wroteFile = true
+			else
+				notifyUser("Auto Execute", "Không ghi được file autoexec: " .. tostring(errW), 4)
+			end
+		end
+
+		if hasExecutorFn("queue_on_teleport") then
+			callExecutorFn("queue_on_teleport", loaderCode)
+		end
+
+		Config.autoExecute = true
+		if not wroteFile then
+			notifyUser("Auto Execute", "Đã kích hoạt queue_on_teleport (hoặc kiểm tra quyền writefile).", 4)
+		end
+		return true
+	else
+		Config.autoExecute = false
+		if hasExecutorFn("isfile") and hasExecutorFn("delfile") then
+			local okIs, exists = callExecutorFn("isfile", AUTOEXEC_FILE)
+			if okIs and exists then
+				callExecutorFn("delfile", AUTOEXEC_FILE)
+			end
+		elseif hasExecutorFn("delfile") then
+			callExecutorFn("delfile", AUTOEXEC_FILE)
+		end
+		return true
+	end
+end
+
+local function readSavedConfigJson()
+	-- Ưu tiên AutoFarmHub/config.json, dự phòng tên file phẳng AutoFarmHub_config.json
+	if hasExecutorFn("isfile") and hasExecutorFn("readfile") then
+		local ok1, ex1 = callExecutorFn("isfile", CONFIG_FILE)
+		if ok1 and ex1 then
+			return callExecutorFn("readfile", CONFIG_FILE)
+		end
+		local ok2, ex2 = callExecutorFn("isfile", FLAT_CONFIG_FILE)
+		if ok2 and ex2 then
+			return callExecutorFn("readfile", FLAT_CONFIG_FILE)
+		end
+		return false, "NOT_FOUND"
+	elseif hasExecutorFn("readfile") then
+		local ok1, res1 = callExecutorFn("readfile", CONFIG_FILE)
+		if ok1 and type(res1) == "string" then
+			return true, res1
+		end
+		local ok2, res2 = callExecutorFn("readfile", FLAT_CONFIG_FILE)
+		if ok2 and type(res2) == "string" then
+			return true, res2
+		end
+		return false, "NOT_FOUND"
+	end
+	return false, "Executor không hỗ trợ readfile"
+end
+
+local function writeSavedConfigJson(encodedStr)
+	if not hasExecutorFn("writefile") then
+		return false, "Executor không hỗ trợ writefile"
+	end
+	if hasExecutorFn("makefolder") then
+		callExecutorFn("makefolder", CONFIG_FOLDER)
+	end
+	local okMain, errMain = callExecutorFn("writefile", CONFIG_FILE, encodedStr)
+	if okMain then
+		return true, CONFIG_FILE
+	end
+	local okFlat, errFlat = callExecutorFn("writefile", FLAT_CONFIG_FILE, encodedStr)
+	if okFlat then
+		return true, FLAT_CONFIG_FILE
+	end
+	return false, tostring(errMain) .. " | " .. tostring(errFlat)
+end
+
+local function performSaveConfig()
+	Config.version = "1.1.0"
+	Config.savedAt = os.time()
+
+	local okEnc, encoded = pcall(function()
+		return HttpService:JSONEncode(Config)
+	end)
+	if not okEnc or type(encoded) ~= "string" then
+		notifyUser("Save", "Lỗi mã hoá JSON cấu hình.", 4)
+		return
+	end
+
+	local okWrite, info = writeSavedConfigJson(encoded)
+	if okWrite then
+		notifyUser("Save", "Đã lưu toàn bộ cấu hình thành công (" .. tostring(info) .. ").", 4)
+	else
+		notifyUser("Save", "Lưu thất bại: " .. tostring(info), 5)
+	end
+end
+
+local function applyConfigToUIAndLogic(silentAutoLoad)
+	isLoading = true
+	local okWrap, errWrap = pcall(function()
+		-- Cập nhật UI elements theo Config
+		if Elements.item then
+			pcall(function() Elements.item:Set({ Config.item }) end)
+		end
+		if Elements.clickCoordsRaw then
+			pcall(function() Elements.clickCoordsRaw:Set(tostring(Config.clickCoordsRaw or "380;172")) end)
+		end
+		if Elements.textboxText then
+			pcall(function() Elements.textboxText:Set(tostring(Config.textboxText or "")) end)
+		end
+		if Elements.detectClick then
+			pcall(function() Elements.detectClick:Set(Config.detectClick == true) end)
+		end
+		if Elements.autoExecute then
+			pcall(function() Elements.autoExecute:Set(Config.autoExecute == true) end)
+		end
+		if Elements.autoLoad then
+			pcall(function() Elements.autoLoad:Set(Config.autoLoad == true) end)
+		end
+		if Elements.autoFarm then
+			pcall(function() Elements.autoFarm:Set(Config.autoFarm == true) end)
+		end
+
+		-- Áp dụng trực tiếp logic trạng thái sau khi gán UI
+		if Config.detectClick then
+			createDetectClickMiniGui()
+		else
+			destroyDetectClickMiniGui()
+		end
+
+		if Config.autoExecute then
+			applyAutoExecuteState(true)
+		end
+
+		if Config.autoFarm then
+			startAutoFarm()
+		else
+			stopAutoFarm()
+		end
+	end)
+	isLoading = false
+
+	if not okWrap then
+		notifyUser("Load", "Lỗi áp dụng cấu hình: " .. tostring(errWrap), 4)
+		return false
+	end
+
+	if silentAutoLoad then
+		notifyUser("Auto Load", "Đã tự động load", 4)
+	else
+		notifyUser("Load", "Đã tải và áp dụng toàn bộ cấu hình.", 4)
+	end
+	return true
+end
+
+local function performLoadConfig(silentAutoLoad)
+	local okRead, rawContent = readSavedConfigJson()
+	if not okRead then
+		if rawContent == "NOT_FOUND" then
+			if not silentAutoLoad then
+				notifyUser("Load", "chưa có cấu hình đã lưu", 4)
+			end
+		else
+			notifyUser("Load", tostring(rawContent), 4)
+		end
+		return false
+	end
+
+	local okDec, decoded = pcall(function()
+		return HttpService:JSONDecode(rawContent)
+	end)
+	if not okDec or type(decoded) ~= "table" then
+		notifyUser("Load", "File cấu hình bị hỏng hoặc không phải JSON hợp lệ.", 4)
+		return false
+	end
+
+	mergeConfigFromDecoded(decoded)
+	return applyConfigToUIAndLogic(silentAutoLoad)
+end
+
+-- Parse chuỗi dạng "X;Y" (cho phép khoảng trắng quanh dấu ';')
+local function parseCoordsString(rawStr)
+	if type(rawStr) ~= "string" then
+		return nil, nil
+	end
+	local trimmed = string.match(rawStr, "^%s*(.-)%s*$") or ""
+	local sx, sy = string.match(trimmed, "^([+-]?%d*%.?%d+)%s*;%s*([+-]?%d*%.?%d+)$")
+	if not sx or not sy then
+		return nil, nil
+	end
+	local nx = tonumber(sx)
+	local ny = tonumber(sy)
+	if not nx or not ny then
+		return nil, nil
+	end
+	return nx, ny
+end
+
+-- ============================================================================
+-- [ KHU VỰC 10: TẠO CỬA SỔ RAYFIELD & 2 TAB (AUTO FARM + SETTING) ]
+-- ============================================================================
+local Window = Rayfield:CreateWindow({
+	Name = "Auto Farm Hub",
+	Icon = 0,
+	LoadingTitle = "Auto Farm Hub",
+	LoadingSubtitle = "Rayfield UI",
+	Theme = "Default",
+	DisableRayfieldPrompts = false,
+	DisableBuildWarnings = false,
+	ConfigurationSaving = {
+		Enabled = false,
+		FolderName = nil,
+		FileName = "Config"
+	},
+	Discord = {
+		Enabled = false,
+		Invite = "",
+		RememberJoins = false
+	},
+	KeySystem = false
+})
+
+local AutoFarmTab = Window:CreateTab("Auto Farm", nil)
+local SettingTab = Window:CreateTab("Setting", nil)
+
+-- ----------------------------------------------------------------------------
+-- TAB 1: "AUTO FARM" (ĐÚNG 5 PHẦN TỬ THEO THỨ TỰ)
+-- ----------------------------------------------------------------------------
+
+-- 1.1 Auto Farm — Toggle (mặc định tắt)
+Elements.autoFarm = AutoFarmTab:CreateToggle({
+	Name = "Auto Farm",
+	CurrentValue = Config.autoFarm,
+	Flag = nil,
+	Callback = function(Value)
+		if isLoading then
+			return
+		end
+		if Value then
+			startAutoFarm()
+		else
+			stopAutoFarm()
+		end
+	end
+})
+
+-- 1.2 Vật phẩm — Dropdown (chọn đúng 1 trong 5, mặc định "1")
+Elements.item = AutoFarmTab:CreateDropdown({
+	Name = "Vật phẩm",
+	Options = { "1", "2", "3", "4", "5" },
+	CurrentOption = { Config.item },
+	MultipleOptions = false,
+	Flag = nil,
+	Callback = function(Options)
+		if isLoading then
+			return
+		end
+		local chosen = (type(Options) == "table" and Options[1]) or tostring(Options or "1")
+		if not Config.ITEM_KEY_MAP[tostring(chosen)] then
+			chosen = "1"
+		end
+		Config.item = tostring(chosen)
+		if Config.autoFarm and not ServerState.isLobbyFrozen then
+			syncHotbarSelection(Runtime.autoFarmRunId, true)
+		end
+	end
+})
+
+-- 1.3 Phát hiện click — Toggle (mặc định tắt)
+Elements.detectClick = AutoFarmTab:CreateToggle({
+	Name = "Phát hiện click",
+	CurrentValue = Config.detectClick,
+	Flag = nil,
+	Callback = function(Value)
+		if isLoading then
+			return
+		end
+		Config.detectClick = Value == true
+		if Config.detectClick then
+			createDetectClickMiniGui()
+		else
+			destroyDetectClickMiniGui()
+		end
+	end
+})
+
+-- 1.4 Click toạ độ — Input (mặc định "380;172")
+Elements.clickCoordsRaw = AutoFarmTab:CreateInput({
+	Name = "Click toạ độ",
+	CurrentValue = tostring(Config.clickCoordsRaw or "380;172"),
+	PlaceholderText = "Ví dụ: 320;172",
+	RemoveTextAfterFocusLost = false,
+	Flag = nil,
+	Callback = function(Text)
+		if isLoading then
+			return
+		end
+		local px, py = parseCoordsString(tostring(Text or ""))
+		if px and py then
+			Config.clickCoordsRaw = tostring(Text)
+			Config.clickX = px
+			Config.clickY = py
+		else
+			notifyUser("Click toạ độ", "Định dạng không hợp lệ (dùng dạng X;Y, ví dụ 320;172). Giữ giá trị cũ: " .. tostring(Config.clickCoordsRaw), 4)
+			if Elements.clickCoordsRaw then
+				pcall(function()
+					Elements.clickCoordsRaw:Set(tostring(Config.clickCoordsRaw))
+				end)
+			end
+		end
+	end
+})
+
+-- 1.5 Ghi textbox — Input (mặc định rỗng)
+Elements.textboxText = AutoFarmTab:CreateInput({
+	Name = "Ghi textbox",
+	CurrentValue = tostring(Config.textboxText or ""),
+	PlaceholderText = "Để trống nếu không ghi chữ",
+	RemoveTextAfterFocusLost = false,
+	Flag = nil,
+	Callback = function(Text)
+		if isLoading then
+			return
+		end
+		Config.textboxText = tostring(Text or "")
+	end
+})
+
+-- ----------------------------------------------------------------------------
+-- TAB 2: "SETTING"
+-- ----------------------------------------------------------------------------
+
+-- 2.1 Auto Execute — Toggle
+Elements.autoExecute = SettingTab:CreateToggle({
+	Name = "Auto Execute",
+	CurrentValue = Config.autoExecute,
+	Flag = nil,
+	Callback = function(Value)
+		if isLoading then
+			return
+		end
+		applyAutoExecuteState(Value == true)
+	end
+})
+
+-- 2.2 Save — Button
+SettingTab:CreateButton({
+	Name = "Save",
+	Callback = function()
+		showClassicConfirm(
+			"Xác nhận lưu cấu hình",
+			"Bạn có chắc muốn LƯU toàn bộ cấu hình không?",
+			function()
+				performSaveConfig()
+			end
+		)
+	end
+})
+
+-- 2.3 Load — Button
+SettingTab:CreateButton({
+	Name = "Load",
+	Callback = function()
+		showClassicConfirm(
+			"Xác nhận tải cấu hình",
+			"Bạn có chắc muốn TẢI cấu hình đã lưu không?",
+			function()
+				performLoadConfig(false)
+			end
+		)
+	end
+})
+
+-- 2.4 Auto Load — Toggle
+Elements.autoLoad = SettingTab:CreateToggle({
+	Name = "Auto Load",
+	CurrentValue = Config.autoLoad,
+	Flag = nil,
+	Callback = function(Value)
+		if isLoading then
+			return
+		end
+		Config.autoLoad = Value == true
+	end
+})
+
+-- ============================================================================
+-- [ KHU VỰC 11: TỰ ĐỘNG LOAD KHI KHỞI ĐỘNG NẾU AUTOLOAD BẬT ]
+-- ============================================================================
+do
+	local okReadInit, rawInit = readSavedConfigJson()
+	if okReadInit and type(rawInit) == "string" then
+		local okDecInit, decodedInit = pcall(function()
+			return HttpService:JSONDecode(rawInit)
+		end)
+		if okDecInit and type(decodedInit) == "table" and decodedInit.autoLoad == true then
+			mergeConfigFromDecoded(decodedInit)
+			applyConfigToUIAndLogic(true)
+		end
+	end
+end
