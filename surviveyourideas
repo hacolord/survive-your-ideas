@@ -57,12 +57,13 @@ local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
 local VirtualInputManager = pcall(function() return game:GetService("VirtualInputManager") end) and game:GetService("VirtualInputManager")
 
--- Đường dẫn script raw cho Auto Execute (người dùng điền link raw vào biến bên dưới)
-local SCRIPT_URL = "ĐIỀN_LINK_RAW_CỦA_SCRIPT_NÀY_VÀO_ĐÂY"
+-- Đường dẫn script raw cho Auto Execute (đã điền URL người dùng cung cấp)
+local SCRIPT_URL = "https://raw.githubusercontent.com/hacolord/survive-your-ideas/refs/heads/main/surviveyourideas"
 local CONFIG_FOLDER = "AutoFarmHub"
 local CONFIG_FILE = CONFIG_FOLDER .. "/config.json"
 local FLAT_CONFIG_FILE = "AutoFarmHub_config.json"
 local AUTOEXEC_FILE = "autoexec/AutoFarmHub.lua"
+local SERVER_STATE_FILE = CONFIG_FOLDER .. "/server_transition_state.json"
 
 -- Hàm thông báo qua Rayfield an toàn
 local function notifyUser(title, content, duration)
@@ -184,7 +185,7 @@ end
 
 local DEFAULT_CONFIG = {
 	-- Metadata
-	version = "1.1.0",
+	version = "1.3.0",
 	savedAt = 0,
 
 	-- Nhóm A: Tab Auto Farm
@@ -237,7 +238,9 @@ local DEFAULT_CONFIG = {
 	LOBBY_CLICK_Y = 265,
 	LOBBY_CLICK_INTERVAL = 5.0,
 	LOBBY_MAX_CLICKS = 3,
-	SERVER_POLL_INTERVAL = 0.5
+	SERVER_POLL_INTERVAL = 0.5,
+	LOBBY_PLACE_ID = 77900175935766,
+	GAME_PLACE_ID = 109001332046330
 }
 
 local function deepCopy(orig)
@@ -360,27 +363,65 @@ end
 ensureCharacterReady()
 
 -- ============================================================================
--- [ KHU VỰC 3.5: THEO DÕI CHUYỂN ĐỔI ID SERVER & TRẠNG THÁI LOBBY / VÁN GAME ]
+-- [ KHU VỰC 3.5: XÁC NHẬN LOBBY (PLACEID 77900175935766) & VÁN GAME (PLACEID 109001332046330) ]
 -- ============================================================================
--- Khi mới bật code: bắt buộc nhận định server hiện tại là server lobby,
--- đóng băng Auto Farm (kể cả khi bật Auto Farm), tự click toạ độ 328;265 mỗi 5s tối đa 3 lần.
--- Mỗi khi ID server chuyển đổi (kể cả quay lại server có ID giống server lobby ban đầu):
--- ghi nhận sự chuyển đổi để đảo trạng thái giữa server lobby và ván game thực sự.
-local function getCurrentServerSignature()
-	local placeIdStr = tostring(game.PlaceId or 0)
-	local jobIdStr = tostring(game.JobId or "")
-	return placeIdStr .. ":" .. jobIdStr
+-- Xác nhận lobby chỉ dựa vào PlaceId == 77900175935766 (lúc đó mới tự click toạ độ đã nêu và đóng băng Auto Farm).
+-- Xác nhận ván game chỉ dựa vào PlaceId == 109001332046330 (lúc đó mới huỷ đóng băng Auto Farm).
+local function getCurrentPlaceIdNumber()
+	return tonumber(game.PlaceId) or 0
 end
 
+local function isLobbyPlaceId(placeIdNum)
+	local targetLobby = tonumber(Config.LOBBY_PLACE_ID) or 77900175935766
+	return (tonumber(placeIdNum) or 0) == targetLobby
+end
+
+local function isGamePlaceId(placeIdNum)
+	local targetGame = tonumber(Config.GAME_PLACE_ID) or 109001332046330
+	return (tonumber(placeIdNum) or 0) == targetGame
+end
+
+local function savePersistedServerState(placeIdNum, frozenBool)
+	Runtime.persistedServerState = {
+		lastPlaceId = tonumber(placeIdNum) or 0,
+		isLobbyFrozen = frozenBool == true,
+		initialized = true
+	}
+	if hasExecutorFn("writefile") then
+		if hasExecutorFn("makefolder") then
+			callExecutorFn("makefolder", CONFIG_FOLDER)
+		end
+		local okEnc, encoded = pcall(function()
+			return HttpService:JSONEncode({
+				lastPlaceId = tonumber(placeIdNum) or 0,
+				isLobbyFrozen = frozenBool == true,
+				updatedAt = os.time()
+			})
+		end)
+		if okEnc and type(encoded) == "string" then
+			callExecutorFn("writefile", SERVER_STATE_FILE, encoded)
+		end
+	end
+end
+
+local initialPlaceId = getCurrentPlaceIdNumber()
+local initialIsLobby = isLobbyPlaceId(initialPlaceId)
+local initialIsGame = isGamePlaceId(initialPlaceId)
+
 local ServerState = {
-	lastSignature = getCurrentServerSignature(),
-	isLobbyFrozen = true,
+	lastPlaceId = initialPlaceId,
+	isLobbyFrozen = initialIsLobby,
 	lobbyClickSessionId = 0,
 	lobbyClicksDone = 0
 }
 
+savePersistedServerState(ServerState.lastPlaceId, ServerState.isLobbyFrozen)
+
 local function clickAtLobbyCoordsOnce()
 	if not VirtualInputManager then
+		return
+	end
+	if not isLobbyPlaceId(getCurrentPlaceIdNumber()) then
 		return
 	end
 	local lx = tonumber(Config.LOBBY_CLICK_X) or 328
@@ -394,6 +435,9 @@ local function clickAtLobbyCoordsOnce()
 end
 
 local function startLobbyClickSequence()
+	if not isLobbyPlaceId(getCurrentPlaceIdNumber()) then
+		return
+	end
 	ServerState.lobbyClickSessionId = (ServerState.lobbyClickSessionId or 0) + 1
 	local mySession = ServerState.lobbyClickSessionId
 	ServerState.lobbyClicksDone = 0
@@ -402,17 +446,17 @@ local function startLobbyClickSequence()
 		local maxClicks = tonumber(Config.LOBBY_MAX_CLICKS) or 3
 		local interval = tonumber(Config.LOBBY_CLICK_INTERVAL) or 5.0
 
-		while ServerState.isLobbyFrozen and ServerState.lobbyClickSessionId == mySession and ServerState.lobbyClicksDone < maxClicks do
+		while ServerState.isLobbyFrozen and isLobbyPlaceId(getCurrentPlaceIdNumber()) and ServerState.lobbyClickSessionId == mySession and ServerState.lobbyClicksDone < maxClicks do
 			clickAtLobbyCoordsOnce()
 			ServerState.lobbyClicksDone += 1
 
-			if ServerState.lobbyClicksDone >= maxClicks or not ServerState.isLobbyFrozen or ServerState.lobbyClickSessionId ~= mySession then
+			if ServerState.lobbyClicksDone >= maxClicks or not ServerState.isLobbyFrozen or not isLobbyPlaceId(getCurrentPlaceIdNumber()) or ServerState.lobbyClickSessionId ~= mySession then
 				break
 			end
 
 			local elapsed = 0
 			while elapsed < interval do
-				if not ServerState.isLobbyFrozen or ServerState.lobbyClickSessionId ~= mySession then
+				if not ServerState.isLobbyFrozen or not isLobbyPlaceId(getCurrentPlaceIdNumber()) or ServerState.lobbyClickSessionId ~= mySession then
 					return
 				end
 				local dt = task.wait(math.min(0.1, interval - elapsed))
@@ -424,6 +468,7 @@ end
 
 local function enterLobbyFrozenState(reasonText)
 	ServerState.isLobbyFrozen = true
+	savePersistedServerState(ServerState.lastPlaceId, true)
 	startLobbyClickSequence()
 	if reasonText then
 		notifyUser("Server Lobby", reasonText, 4)
@@ -432,6 +477,7 @@ end
 
 local function exitLobbyFrozenState(reasonText)
 	ServerState.isLobbyFrozen = false
+	savePersistedServerState(ServerState.lastPlaceId, false)
 	ServerState.lobbyClickSessionId = (ServerState.lobbyClickSessionId or 0) + 1
 	ServerState.lobbyClicksDone = 0
 	if reasonText then
@@ -439,24 +485,27 @@ local function exitLobbyFrozenState(reasonText)
 	end
 end
 
-local function handleServerIdTransition(newSig)
-	ServerState.lastSignature = newSig
-	if ServerState.isLobbyFrozen then
-		-- Đang ở lobby -> chuyển sang server ván game thực sự: huỷ đóng băng Auto Farm
-		exitLobbyFrozenState("Đã phát hiện chuyển đổi ID server sang ván game. Đã huỷ đóng băng Auto Farm.")
+local function applyPlaceIdState(placeIdNum)
+	ServerState.lastPlaceId = placeIdNum
+	if isLobbyPlaceId(placeIdNum) then
+		enterLobbyFrozenState("Đã xác nhận PlaceId lobby (" .. tostring(placeIdNum) .. "). Đóng băng Auto Farm và tự click 328;265 mỗi 5s (tối đa 3 lần).")
+	elseif isGamePlaceId(placeIdNum) then
+		exitLobbyFrozenState("Đã xác nhận PlaceId ván game (" .. tostring(placeIdNum) .. "). Đã huỷ đóng băng Auto Farm.")
 	else
-		-- Đang ở ván game -> chuyển về lại lobby (kể cả cùng ID server cũ): nhận định là lobby, đóng băng Auto Farm và click lại 3 lần
-		enterLobbyFrozenState("Đã phát hiện chuyển đổi ID server về lobby. Đóng băng Auto Farm và tự click 328;265 mỗi 5s (tối đa 3 lần).")
+		savePersistedServerState(placeIdNum, ServerState.isLobbyFrozen)
 	end
 end
 
--- Khởi động luồng theo dõi chuyển đổi ID server ngay khi script chạy
+-- Khởi động luồng theo dõi PlaceId ngay khi script chạy
 do
 	Runtime.lobbyWatcherRunId = (Runtime.lobbyWatcherRunId or 0) + 1
 	local myWatcherId = Runtime.lobbyWatcherRunId
-	ServerState.lastSignature = getCurrentServerSignature()
-	ServerState.isLobbyFrozen = true
-	startLobbyClickSequence()
+	if initialIsLobby then
+		ServerState.isLobbyFrozen = true
+		startLobbyClickSequence()
+	elseif initialIsGame then
+		ServerState.isLobbyFrozen = false
+	end
 
 	task.spawn(function()
 		while Runtime.lobbyWatcherRunId == myWatcherId do
@@ -465,9 +514,9 @@ do
 			if Runtime.lobbyWatcherRunId ~= myWatcherId then
 				return
 			end
-			local currentSig = getCurrentServerSignature()
-			if currentSig ~= ServerState.lastSignature then
-				handleServerIdTransition(currentSig)
+			local curPlaceId = getCurrentPlaceIdNumber()
+			if curPlaceId ~= ServerState.lastPlaceId then
+				applyPlaceIdState(curPlaceId)
 			end
 		end
 	end)
@@ -731,9 +780,9 @@ local function startAutoFarm()
 
 	currentOriginPos = hrp.Position
 
-	-- Nếu đang ở server lobby thì đóng băng Auto Farm (không chạy vòng lặp farm khi đang ở lobby)
+	-- Nếu đang ở server lobby (PlaceId 77900175935766) thì đóng băng Auto Farm
 	if ServerState.isLobbyFrozen then
-		notifyUser("Auto Farm", "Đang ở server lobby: Auto Farm bị đóng băng cho tới khi sang server ván game.", 4)
+		notifyUser("Auto Farm", "Đang ở server lobby: Auto Farm bị đóng băng cho tới khi sang PlaceId ván game.", 4)
 		return
 	end
 
@@ -1081,10 +1130,49 @@ local function showClassicConfirm(title, message, onYes)
 end
 
 -- ============================================================================
--- [ KHU VỰC 9: AUTO EXECUTE & SAVE / LOAD CẤU HÌNH ]
+-- [ KHU VỰC 9: AUTO EXECUTE (GẮN NHẬN DIỆN PLACEID TRƯỚC LOADSCRIPT) & SAVE/LOAD ]
 -- ============================================================================
+-- Đặt bộ nhận diện PlaceId (lobby = 77900175935766, ván game = 109001332046330) NGAY ĐẰNG TRƯỚC loadstring(game:HttpGet(SCRIPT_URL))()
+-- để khi auto execute hoặc teleport chạy lại, trạng thái lobby/ván game được ghi nhận trước khi mã chính chạy.
 local function buildAutoExecLoaderCode()
-	return 'loadstring(game:HttpGet("' .. tostring(SCRIPT_URL) .. '"))()'
+	local urlStr = tostring(SCRIPT_URL)
+	local preLoadGuard = [=[
+pcall(function()
+	if not game:IsLoaded() then game.Loaded:Wait() end
+	local HttpService = game:GetService("HttpService")
+	local env = getgenv()
+	env.__AutoFarmHub_Runtime_State__ = env.__AutoFarmHub_Runtime_State__ or {}
+	local rt = env.__AutoFarmHub_Runtime_State__
+	local curPlaceId = tonumber(game.PlaceId) or 0
+	local lobbyPlaceId = 77900175935766
+	local gamePlaceId = 109001332046330
+	local nextFrozen = false
+	if curPlaceId == lobbyPlaceId then
+		nextFrozen = true
+	elseif curPlaceId == gamePlaceId then
+		nextFrozen = false
+	end
+	rt.persistedServerState = {
+		lastPlaceId = curPlaceId,
+		isLobbyFrozen = nextFrozen,
+		initialized = true
+	}
+	if type(writefile) == "function" then
+		if type(makefolder) == "function" then pcall(makefolder, "AutoFarmHub") end
+		local okEnc, enc = pcall(function()
+			return HttpService:JSONEncode({
+				lastPlaceId = curPlaceId,
+				isLobbyFrozen = nextFrozen,
+				updatedAt = os.time()
+			})
+		end)
+		if okEnc and type(enc) == "string" then
+			pcall(writefile, "AutoFarmHub/server_transition_state.json", enc)
+		end
+	end
+end)
+]=]
+	return preLoadGuard .. 'loadstring(game:HttpGet("' .. urlStr .. '"))()'
 end
 
 local function applyAutoExecuteState(enabled)
@@ -1180,7 +1268,7 @@ local function writeSavedConfigJson(encodedStr)
 end
 
 local function performSaveConfig()
-	Config.version = "1.1.0"
+	Config.version = "1.3.0"
 	Config.savedAt = os.time()
 
 	local okEnc, encoded = pcall(function()
