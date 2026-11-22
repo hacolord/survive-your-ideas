@@ -191,6 +191,7 @@ local DEFAULT_CONFIG = {
 
 	-- Nhóm A: Tab Auto Farm
 	autoFarm = false,
+	virtualClick = false,
 	flySpeed = 100,
 	item = "1",
 	detectClick = false,
@@ -375,8 +376,8 @@ ensureCharacterReady()
 -- ============================================================================
 -- [ KHU VỰC 3.5: XÁC NHẬN LOBBY (PLACEID 77900175935766) & VÁN GAME (PLACEID 109001332046330) ]
 -- ============================================================================
--- Xác nhận lobby chỉ dựa vào PlaceId == 77900175935766 (lúc đó mới tự click toạ độ đã nêu và đóng băng Auto Farm).
--- Xác nhận ván game chỉ dựa vào PlaceId == 109001332046330 (lúc đó mới huỷ đóng băng Auto Farm và click 607;66 sau 7.5s trong 3 lần, mỗi lần cách nhau 5s).
+-- Xác nhận lobby chỉ dựa vào PlaceId == 77900175935766 (lúc đó mới tự click toạ độ đã nêu khi bật Click ảo và đóng băng Auto Farm).
+-- Xác nhận ván game chỉ dựa vào PlaceId == 109001332046330 (lúc đó mới huỷ đóng băng Auto Farm và click 607;66 sau 7.5s trong 3 lần, mỗi lần cách nhau 5s khi bật Click ảo).
 local function getCurrentPlaceIdNumber()
 	return tonumber(game.PlaceId) or 0
 end
@@ -389,6 +390,10 @@ end
 local function isGamePlaceId(placeIdNum)
 	local targetGame = tonumber(Config.GAME_PLACE_ID) or 109001332046330
 	return (tonumber(placeIdNum) or 0) == targetGame
+end
+
+local function isVirtualClickEnabled()
+	return Config.virtualClick == true
 end
 
 local function savePersistedServerState(placeIdNum, frozenBool)
@@ -430,7 +435,7 @@ local ServerState = {
 savePersistedServerState(ServerState.lastPlaceId, ServerState.isLobbyFrozen)
 
 local function clickAtLobbyCoordsOnce()
-	if not VirtualInputManager then
+	if not VirtualInputManager or not isVirtualClickEnabled() then
 		return
 	end
 	if not isLobbyPlaceId(getCurrentPlaceIdNumber()) then
@@ -447,7 +452,7 @@ local function clickAtLobbyCoordsOnce()
 end
 
 local function clickAtMatchCoordsOnce()
-	if not VirtualInputManager then
+	if not VirtualInputManager or not isVirtualClickEnabled() then
 		return
 	end
 	if not isGamePlaceId(getCurrentPlaceIdNumber()) then
@@ -486,7 +491,9 @@ local function startMatchClickSequence()
 		end
 
 		while isGamePlaceId(getCurrentPlaceIdNumber()) and ServerState.matchClickSessionId == myMatchSession and ServerState.matchClicksDone < maxClicks do
-			clickAtMatchCoordsOnce()
+			if isVirtualClickEnabled() then
+				clickAtMatchCoordsOnce()
+			end
 			ServerState.matchClicksDone += 1
 
 			if ServerState.matchClicksDone >= maxClicks or not isGamePlaceId(getCurrentPlaceIdNumber()) or ServerState.matchClickSessionId ~= myMatchSession then
@@ -518,7 +525,9 @@ local function startLobbyClickSequence()
 		local interval = tonumber(Config.LOBBY_CLICK_INTERVAL) or 5.0
 
 		while ServerState.isLobbyFrozen and isLobbyPlaceId(getCurrentPlaceIdNumber()) and ServerState.lobbyClickSessionId == mySession and ServerState.lobbyClicksDone < maxClicks do
-			clickAtLobbyCoordsOnce()
+			if isVirtualClickEnabled() then
+				clickAtLobbyCoordsOnce()
+			end
 			ServerState.lobbyClicksDone += 1
 
 			if ServerState.lobbyClicksDone >= maxClicks or not ServerState.isLobbyFrozen or not isLobbyPlaceId(getCurrentPlaceIdNumber()) or ServerState.lobbyClickSessionId ~= mySession then
@@ -562,9 +571,9 @@ end
 local function applyPlaceIdState(placeIdNum)
 	ServerState.lastPlaceId = placeIdNum
 	if isLobbyPlaceId(placeIdNum) then
-		enterLobbyFrozenState("Đã xác nhận PlaceId lobby (" .. tostring(placeIdNum) .. "). Đóng băng Auto Farm và tự click 328;265 mỗi 5s (tối đa 3 lần).")
+		enterLobbyFrozenState("Đã xác nhận PlaceId lobby (" .. tostring(placeIdNum) .. "). Đóng băng Auto Farm và xử lý click 328;265 khi bật Click ảo.")
 	elseif isGamePlaceId(placeIdNum) then
-		exitLobbyFrozenState("Đã xác nhận PlaceId ván game (" .. tostring(placeIdNum) .. "). Đã huỷ đóng băng Auto Farm và lên lịch click 607;66 sau 7.5s (3 lần, cách 5s).")
+		exitLobbyFrozenState("Đã xác nhận PlaceId ván game (" .. tostring(placeIdNum) .. "). Đã huỷ đóng băng Auto Farm và xử lý click 607;66 sau 7.5s (3 lần, cách 5s) khi bật Click ảo.")
 	else
 		savePersistedServerState(placeIdNum, ServerState.isLobbyFrozen)
 	end
@@ -778,6 +787,7 @@ local isBusy = false
 local textboxCycleEntries = {}
 local textboxCycleRawParsed = nil
 local textboxCycleInvalid = false
+local textboxCycleCursorIndex = 1
 local lastTextboxCommitClock = 0
 
 -- Kiểm tra và tách chuỗi ghi textbox hợp lệ dạng mục1/mục2/...
@@ -837,6 +847,7 @@ local function resetTextboxCycle(notifyIfInvalid)
 	textboxCycleRawParsed = rawStr
 	textboxCycleInvalid = isInvalid == true
 	textboxCycleEntries = (type(parsed) == "table") and parsed or {}
+	textboxCycleCursorIndex = 1
 	lastTextboxCommitClock = 0
 
 	if isInvalid and notifyIfInvalid then
@@ -845,32 +856,63 @@ local function resetTextboxCycle(notifyIfInvalid)
 	return isValidPattern
 end
 
+local function isEntryAvailable(entry)
+	if not entry then
+		return false
+	end
+	if entry.maxCount == nil then
+		return true
+	end
+	return entry.usedCount < entry.maxCount
+end
+
 local function peekNextTextboxWordFromCycle()
 	local rawStr = tostring(Config.textboxText or "")
 	if rawStr == "" then
-		return nil
+		return nil, nil, nil
 	end
 	if textboxCycleRawParsed ~= rawStr then
 		resetTextboxCycle(true)
 	end
 	if textboxCycleInvalid or #textboxCycleEntries == 0 then
-		return nil
+		return nil, nil, nil
 	end
 
-	for _, entry in ipairs(textboxCycleEntries) do
-		if entry.maxCount == nil then
-			return entry.text, entry
-		elseif entry.usedCount < entry.maxCount then
-			return entry.text, entry
+	local count = #textboxCycleEntries
+	if textboxCycleCursorIndex < 1 or textboxCycleCursorIndex > count then
+		textboxCycleCursorIndex = 1
+	end
+
+	-- Tìm mục khả dụng đầu tiên tính từ vị trí con trỏ hiện tại; nếu từ con trỏ tới cuối hết lượt thì quét tiếp từ đầu (1 -> cursorIndex - 1)
+	for idx = textboxCycleCursorIndex, count do
+		local entry = textboxCycleEntries[idx]
+		if isEntryAvailable(entry) then
+			return entry.text, entry, idx
 		end
 	end
 
-	return nil, nil
+	for idx = 1, textboxCycleCursorIndex - 1 do
+		local entry = textboxCycleEntries[idx]
+		if isEntryAvailable(entry) then
+			return entry.text, entry, idx
+		end
+	end
+
+	return nil, nil, nil
 end
 
-local function commitTextboxWordEntry(entry)
+local function commitTextboxWordEntry(entry, usedIdx)
 	if entry and entry.maxCount ~= nil and entry.usedCount < entry.maxCount then
 		entry.usedCount += 1
+	end
+	local count = #textboxCycleEntries
+	if count > 0 then
+		local baseIdx = tonumber(usedIdx) or textboxCycleCursorIndex or 1
+		local nextIdx = baseIdx + 1
+		if nextIdx > count then
+			nextIdx = 1
+		end
+		textboxCycleCursorIndex = nextIdx
 	end
 	lastTextboxCommitClock = os.clock()
 end
@@ -943,12 +985,12 @@ local function fillActiveBox(text)
 	return false
 end
 
--- Một lượt click toạ độ: chỉ khi ô nhập/bàn phím thực sự bật lên mới ghi từ tốn 1 từ rồi chờ đóng hẳn và nghỉ nhịp
+-- Một lượt click toạ độ (chỉ thực hiện khi bật Click ảo): chỉ khi ô nhập/bàn phím thực sự bật lên mới ghi từ tốn 1 từ rồi chờ đóng hẳn và nghỉ nhịp
 local function clickTargetAndTypeOnce(runId)
 	if isBusy then
 		return
 	end
-	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+	if not Config.autoFarm or not isVirtualClickEnabled() or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
 		return
 	end
 	isBusy = true
@@ -966,7 +1008,7 @@ local function clickTargetAndTypeOnce(runId)
 			local remain = cooldown - elapsedSinceCommit
 			local tWait = os.clock()
 			while (os.clock() - tWait) < remain do
-				if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+				if not Config.autoFarm or not isVirtualClickEnabled() or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
 					isBusy = false
 					return
 				end
@@ -975,8 +1017,8 @@ local function clickTargetAndTypeOnce(runId)
 		end
 	end
 
-	-- 1. Click vào toạ độ đã nhập
-	if VirtualInputManager then
+	-- 1. Click vào toạ độ đã nhập (chỉ khi Click ảo đang bật)
+	if VirtualInputManager and isVirtualClickEnabled() then
 		pcall(function()
 			VirtualInputManager:SendMouseButtonEvent(targetX, targetY, 0, true, game, 1)
 			task.wait(holdTime)
@@ -986,7 +1028,7 @@ local function clickTargetAndTypeOnce(runId)
 
 	-- 2. Nếu ô Ghi textbox không rỗng: chỉ khi TextBox / bàn phím ảo bật lên mới ghi 1 từ từ tốn cho lần mở này
 	if rawTextPattern ~= "" then
-		local textToType, targetEntry = peekNextTextboxWordFromCycle()
+		local textToType, targetEntry, usedIdx = peekNextTextboxWordFromCycle()
 		if textToType and textToType ~= "" then
 			local detected = false
 			local timeout = Config.DETECT_TIMEOUT or 2.0
@@ -1003,12 +1045,12 @@ local function clickTargetAndTypeOnce(runId)
 				task.wait(pollStep)
 			end
 
-			-- 3. Khi phát hiện ô nhập bật lên: chờ ngắn rồi điền đúng 1 từ từ tốn, trừ 1 lượt và chờ ô đóng hẳn
+			-- 3. Khi phát hiện ô nhập bật lên: chờ ngắn rồi điền đúng 1 từ từ tốn, chuyển sang mục tiếp theo và chờ ô đóng hẳn
 			if detected and Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
 				task.wait(Config.PRE_FILL_DELAY or 0.15)
 				if Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
 					fillActiveBox(textToType)
-					commitTextboxWordEntry(targetEntry)
+					commitTextboxWordEntry(targetEntry, usedIdx)
 					waitForKeyboardOrBoxClose(runId)
 				end
 			end
@@ -1096,10 +1138,10 @@ local function startAutoFarm()
 		end
 	end)
 
-	-- Luồng 2: Click toạ độ từ tốn + phát hiện/ghi từng từ một khi Auto Farm bật (và không bị đóng băng ở lobby)
+	-- Luồng 2: Khi Click ảo đang bật thì click toạ độ từ tốn + phát hiện/ghi từng từ một khi Auto Farm bật (và không bị đóng băng ở lobby)
 	task.spawn(function()
 		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
-			if not ServerState.isLobbyFrozen then
+			if not ServerState.isLobbyFrozen and isVirtualClickEnabled() then
 				clickTargetAndTypeOnce(myRunId)
 			end
 			if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
@@ -1442,6 +1484,25 @@ pcall(function()
 		isLobbyFrozen = nextFrozen,
 		initialized = true
 	}
+	local allowVirtualClick = false
+	if type(readfile) == "function" then
+		local okCfg, rawCfg = pcall(function()
+			if type(isfile) == "function" and isfile("AutoFarmHub/config.json") then
+				return readfile("AutoFarmHub/config.json")
+			elseif type(isfile) == "function" and isfile("AutoFarmHub_config.json") then
+				return readfile("AutoFarmHub_config.json")
+			end
+			return nil
+		end)
+		if okCfg and type(rawCfg) == "string" then
+			local okDecCfg, decCfg = pcall(function()
+				return HttpService:JSONDecode(rawCfg)
+			end)
+			if okDecCfg and type(decCfg) == "table" and decCfg.virtualClick == true then
+				allowVirtualClick = true
+			end
+		end
+	end
 	if type(writefile) == "function" then
 		if type(makefolder) == "function" then pcall(makefolder, "AutoFarmHub") end
 		local okEnc, enc = pcall(function()
@@ -1455,7 +1516,7 @@ pcall(function()
 			pcall(writefile, "AutoFarmHub/server_transition_state.json", enc)
 		end
 	end
-	if curPlaceId == gamePlaceId and VirtualInputManager then
+	if curPlaceId == gamePlaceId and allowVirtualClick and VirtualInputManager then
 		rt.preMatchClickToken = (tonumber(rt.preMatchClickToken) or 0) + 1
 		local myToken = rt.preMatchClickToken
 		task.spawn(function()
@@ -1596,6 +1657,9 @@ local function applyConfigToUIAndLogic(silentAutoLoad)
 	isLoading = true
 	local okWrap, errWrap = pcall(function()
 		-- Cập nhật UI elements theo Config
+		if Elements.virtualClick then
+			pcall(function() Elements.virtualClick:Set(Config.virtualClick == true) end)
+		end
 		if Elements.flySpeed then
 			pcall(function() Elements.flySpeed:Set(tostring(Config.flySpeed or 100)) end)
 		end
@@ -1743,6 +1807,19 @@ Elements.autoFarm = AutoFarmTab:CreateToggle({
 		else
 			stopAutoFarm()
 		end
+	end
+})
+
+-- 1.1a Click ảo — Toggle ngay dưới Auto Farm (mặc định tắt, độc lập với Auto Farm)
+Elements.virtualClick = AutoFarmTab:CreateToggle({
+	Name = "Click ảo",
+	CurrentValue = Config.virtualClick,
+	Flag = nil,
+	Callback = function(Value)
+		if isLoading then
+			return
+		end
+		Config.virtualClick = Value == true
 	end
 })
 
