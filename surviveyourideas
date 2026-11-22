@@ -55,6 +55,7 @@ local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
 local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local VirtualInputManager = pcall(function() return game:GetService("VirtualInputManager") end) and game:GetService("VirtualInputManager")
 
 -- Đường dẫn script raw cho Auto Execute (đã điền URL người dùng cung cấp)
@@ -190,6 +191,7 @@ local DEFAULT_CONFIG = {
 
 	-- Nhóm A: Tab Auto Farm
 	autoFarm = false,
+	flySpeed = 100,
 	item = "1",
 	detectClick = false,
 	clickCoordsRaw = "380;172",
@@ -523,11 +525,38 @@ do
 end
 
 -- ============================================================================
--- [ KHU VỰC 4: LOGIC VẬT PHẨM (HOTBAR 1-5), DỊCH CHUYỂN ĐỘ CAO & CLICK/TEXTBOX ]
+-- [ KHU VỰC 4: LOGIC VẬT PHẨM (HOTBAR 1-5), BAY CFRAME LÊN TRỜI & ANCHOR KHI TẮT ]
 -- ============================================================================
-local rng = Random.new()
 local lastEquippedItem = nil
 local lastItemCheckClock = 0
+local currentFlightY = nil
+local isCharacterAnchoredForStop = false
+
+local function setCharacterAnchoredState(anchored)
+	local char, _, hrp = getCharacterAndRoot()
+	if not char then
+		return
+	end
+	pcall(function()
+		if hrp then
+			hrp.Anchored = anchored == true
+			if anchored then
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				hrp.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end)
+end
+
+local function isInActiveMatchContext()
+	if isGamePlaceId(getCurrentPlaceIdNumber()) then
+		return true
+	end
+	if not isLobbyPlaceId(getCurrentPlaceIdNumber()) and not ServerState.isLobbyFrozen then
+		return true
+	end
+	return false
+end
 
 local function resolveKeyCodeFromItem(itemStr)
 	local keyStr = tostring(itemStr or "1")
@@ -599,8 +628,8 @@ local function syncHotbarSelection(runId, forcePress)
 	end
 end
 
--- Dịch chuyển thẳng đứng tới độ cao ngẫu nhiên [MIN_HEIGHT, MAX_HEIGHT] so với originPos.Y, giữ nguyên X và Z, rơi tự do
-local function teleportVerticalStep(originPos, runId)
+-- Bay thẳng đứng lên trời bằng CFrame theo vận tốc (stud/s) phụ thuộc vào Config.flySpeed
+local function flyUpwardByCFrameStep(originPos, dt, runId)
 	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
 		return false
 	end
@@ -609,40 +638,139 @@ local function teleportVerticalStep(originPos, runId)
 		return false
 	end
 
-	local minH = tonumber(Config.MIN_HEIGHT) or 250
-	local maxH = tonumber(Config.MAX_HEIGHT) or 1250
-	if minH > maxH then
-		minH, maxH = maxH, minH
+	local speedStudPerSec = tonumber(Config.flySpeed)
+	if not speedStudPerSec or speedStudPerSec < 0 then
+		speedStudPerSec = tonumber(DEFAULT_CONFIG.flySpeed) or 100
 	end
 
-	local randomOffsetY = rng:NextNumber(minH, maxH)
-	local targetY = originPos.Y + randomOffsetY
+	if type(currentFlightY) ~= "number" then
+		currentFlightY = hrp.Position.Y
+	end
+
+	local deltaY = speedStudPerSec * math.max(0, tonumber(dt) or 0)
+	currentFlightY = currentFlightY + deltaY
 
 	local ok = pcall(function()
-		hrp.CFrame = CFrame.new(originPos.X, targetY, originPos.Z)
+		hrp.Anchored = false
+		hrp.CFrame = CFrame.new(originPos.X, currentFlightY, originPos.Z)
 		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
 	end)
 	return ok
 end
 
--- Dịch chuyển trở lại originPos khi tắt Auto Farm
-local function returnToOrigin(originPos)
-	if not originPos or not Config.RETURN_ON_STOP then
-		return
-	end
-	local _, _, hrp = getCharacterAndRoot()
-	if hrp then
-		pcall(function()
-			hrp.CFrame = CFrame.new(originPos.X, originPos.Y, originPos.Z)
-			hrp.AssemblyLinearVelocity = Vector3.zero
-		end)
+-- Giữ trạng thái khi tắt Auto Farm: nếu đang trong ván game thì anchor cơ thể cho tới khi bật lại Auto Farm
+local function applyStopState(originPos)
+	if isInActiveMatchContext() then
+		isCharacterAnchoredForStop = true
+		setCharacterAnchoredState(true)
+	elseif originPos and Config.RETURN_ON_STOP then
+		local _, _, hrp = getCharacterAndRoot()
+		if hrp then
+			pcall(function()
+				hrp.Anchored = false
+				hrp.CFrame = CFrame.new(originPos.X, originPos.Y, originPos.Z)
+				hrp.AssemblyLinearVelocity = Vector3.zero
+			end)
+		end
 	end
 end
 
 -- ============================================================================
--- [ KHU VỰC 5: LOGIC PHÁT HIỆN & GHI TEXTBOX (THEO MỤC 4 & CODE THAM CHIẾU) ]
+-- [ KHU VỰC 5: LOGIC PHÁT HIỆN & GHI TEXTBOX (CHUỖI TỪ;SỐ / TỪ THEO VÒNG LẶP) ]
 -- ============================================================================
 local isBusy = false
+local textboxCycleEntries = {}
+local textboxCycleRawParsed = nil
+local textboxCycleInvalid = false
+
+-- Kiểm tra và tách chuỗi ghi textbox hợp lệ dạng mục1/mục2/...
+-- Hợp lệ: từng mục là <từ không chứa khoảng trắng, ;, /> hoặc <từ>;<số nguyên >= 1>
+-- Không hợp lệ: ví dụ "earthquake;" (thiếu số sau ;) hoặc "tsunami blackhole earthquake" (nhiều từ cách khoảng trắng không có /)
+local function parseTextboxCyclePattern(rawStr)
+	local str = tostring(rawStr or "")
+	if str == "" then
+		return {}, false, false
+	end
+
+	-- Không cho phép khoảng trắng đầu/cuối hoặc nhiều từ cách khoảng trắng không phân tách bằng /
+	if string.match(str, "^%s") or string.match(str, "%s$") or string.match(str, "%s") then
+		return nil, true, false
+	end
+
+	-- Không cho phép // hoặc / ở đầu/cuối
+	if string.match(str, "^/") or string.match(str, "/$") or string.find(str, "//", 1, true) then
+		return nil, true, false
+	end
+
+	local entries = {}
+	for part in string.gmatch(str, "[^/]+") do
+		if string.find(part, ";", 1, true) then
+			local wordPart, countPart = string.match(part, "^([^;]+);([^;]+)$")
+			local maxCount = countPart and tonumber(countPart) or nil
+			if not wordPart or not maxCount or maxCount < 1 or math.floor(maxCount) ~= maxCount or tostring(math.floor(maxCount)) ~= tostring(countPart) then
+				return nil, true, false
+			end
+			table.insert(entries, {
+				text = wordPart,
+				maxCount = math.floor(maxCount),
+				usedCount = 0
+			})
+		else
+			if part == "" then
+				return nil, true, false
+			end
+			table.insert(entries, {
+				text = part,
+				maxCount = nil, -- nil nghĩa là không giới hạn số lần ghi
+				usedCount = 0
+			})
+		end
+	end
+
+	if #entries == 0 then
+		return nil, true, false
+	end
+
+	return entries, false, true
+end
+
+local function resetTextboxCycle(notifyIfInvalid)
+	local rawStr = tostring(Config.textboxText or "")
+	local parsed, isInvalid, isValidPattern = parseTextboxCyclePattern(rawStr)
+	textboxCycleRawParsed = rawStr
+	textboxCycleInvalid = isInvalid == true
+	textboxCycleEntries = (type(parsed) == "table") and parsed or {}
+
+	if isInvalid and notifyIfInvalid then
+		notifyUser("Ghi textbox", "Chuỗi không hợp lệ (" .. rawStr .. "). Dùng dạng từ hoặc từ;số ngăn cách bằng dấu / (ví dụ: blackhole;1/earthquake/tsunami;11).", 5)
+	end
+	return isValidPattern
+end
+
+local function takeNextTextboxWordFromCycle()
+	local rawStr = tostring(Config.textboxText or "")
+	if rawStr == "" then
+		return nil
+	end
+	if textboxCycleRawParsed ~= rawStr then
+		resetTextboxCycle(true)
+	end
+	if textboxCycleInvalid or #textboxCycleEntries == 0 then
+		return nil
+	end
+
+	for _, entry in ipairs(textboxCycleEntries) do
+		if entry.maxCount == nil then
+			return entry.text
+		elseif entry.usedCount < entry.maxCount then
+			entry.usedCount += 1
+			return entry.text
+		end
+	end
+
+	return nil
+end
 
 -- Lấy TextBox đang mở/được chọn (theo code tham chiếu)
 local function getActiveTextBox()
@@ -696,7 +824,7 @@ local function fillActiveBox(text)
 	return false
 end
 
--- Một lượt click toạ độ (và nếu chuỗi ghi textbox không rỗng thì chờ phát hiện tối đa 2.0s rồi điền)
+-- Một lượt click toạ độ (và nếu chuỗi ghi textbox hợp lệ và còn lượt thì chờ phát hiện tối đa 2.0s rồi điền)
 local function clickTargetAndTypeOnce(runId)
 	if isBusy then
 		return
@@ -708,7 +836,7 @@ local function clickTargetAndTypeOnce(runId)
 
 	local targetX = tonumber(Config.clickX) or 380
 	local targetY = tonumber(Config.clickY) or 172
-	local textToType = tostring(Config.textboxText or "")
+	local rawTextPattern = tostring(Config.textboxText or "")
 	local holdTime = Config.CLICK_HOLD or 0.05
 
 	-- 1. Click vào toạ độ đã nhập
@@ -720,27 +848,30 @@ local function clickTargetAndTypeOnce(runId)
 		end)
 	end
 
-	-- 2. Nếu ô Ghi textbox không rỗng: chờ tối đa DETECT_TIMEOUT (2.0s) xem TextBox / bàn phím ảo bật lên không
-	if textToType ~= "" then
-		local detected = false
-		local timeout = Config.DETECT_TIMEOUT or 2.0
-		local pollStep = Config.POLL_STEP or 0.05
-		local t0 = os.clock()
-		while (os.clock() - t0) < timeout do
-			if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
-				break
+	-- 2. Nếu ô Ghi textbox không rỗng: lấy từ tiếp theo theo vòng lặp và chờ tối đa DETECT_TIMEOUT (2.0s)
+	if rawTextPattern ~= "" then
+		local textToType = takeNextTextboxWordFromCycle()
+		if textToType and textToType ~= "" then
+			local detected = false
+			local timeout = Config.DETECT_TIMEOUT or 2.0
+			local pollStep = Config.POLL_STEP or 0.05
+			local t0 = os.clock()
+			while (os.clock() - t0) < timeout do
+				if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+					break
+				end
+				if isKeyboardOrBoxOpen() then
+					detected = true
+					break
+				end
+				task.wait(pollStep)
 			end
-			if isKeyboardOrBoxOpen() then
-				detected = true
-				break
-			end
-			task.wait(pollStep)
-		end
 
-		-- 3. Nếu phát hiện bật lên thì chờ PRE_FILL_DELAY (0.1s) rồi tự điền chuỗi
-		if detected and Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
-			task.wait(Config.PRE_FILL_DELAY or 0.1)
-			fillActiveBox(textToType)
+			-- 3. Nếu phát hiện bật lên thì chờ PRE_FILL_DELAY (0.1s) rồi tự điền chuỗi
+			if detected and Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
+				task.wait(Config.PRE_FILL_DELAY or 0.1)
+				fillActiveBox(textToType)
+			end
 		end
 	end
 
@@ -757,11 +888,11 @@ local function stopAutoFarm()
 	Runtime.autoFarmRunId = (Runtime.autoFarmRunId or 0) + 1
 	local originToRestore = currentOriginPos
 	currentOriginPos = nil
+	currentFlightY = nil
 	lastEquippedItem = nil
 	isBusy = false
-	if originToRestore then
-		returnToOrigin(originToRestore)
-	end
+	resetTextboxCycle(false)
+	applyStopState(originToRestore)
 end
 
 local function startAutoFarm()
@@ -770,6 +901,9 @@ local function startAutoFarm()
 	Config.autoFarm = true
 	lastEquippedItem = nil
 	lastItemCheckClock = 0
+	currentFlightY = nil
+	isCharacterAnchoredForStop = false
+	resetTextboxCycle(true)
 
 	local _, _, hrp = ensureCharacterReady()
 	if not hrp then
@@ -778,7 +912,13 @@ local function startAutoFarm()
 		return
 	end
 
+	-- Gỡ Anchor nếu trước đó tắt Auto Farm trong ván game bị khoá cơ thể
+	pcall(function()
+		hrp.Anchored = false
+	end)
+
 	currentOriginPos = hrp.Position
+	currentFlightY = hrp.Position.Y
 
 	-- Nếu đang ở server lobby (PlaceId 77900175935766) thì đóng băng Auto Farm
 	if ServerState.isLobbyFrozen then
@@ -789,35 +929,27 @@ local function startAutoFarm()
 	-- Bấm phím chọn đồ 1 lần ngay khi bật Auto Farm
 	syncHotbarSelection(myRunId, true)
 
-	-- Dịch chuyển lên độ cao ngẫu nhiên lần đầu ngay lúc bật
-	teleportVerticalStep(currentOriginPos, myRunId)
-
-	-- Luồng 1: Dịch chuyển độ cao ngẫu nhiên mỗi TELEPORT_INTERVAL (0.75s) + kiểm tra định kỳ cầm đồ
+	-- Luồng 1: Bay lên trời bằng CFrame liên tục theo vận tốc (stud/s) + kiểm tra định kỳ cầm đồ
 	task.spawn(function()
 		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
-			local interval = tonumber(Config.TELEPORT_INTERVAL) or 0.75
-			local elapsed = 0
-			while elapsed < interval do
-				if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
-					return
-				end
-				local dt = task.wait(math.min(0.05, interval - elapsed))
-				elapsed += (dt or 0.05)
-			end
-
+			local dt = RunService.Heartbeat:Wait()
 			if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
 				return
 			end
 
 			if not ServerState.isLobbyFrozen then
-				-- Đảm bảo có originPos nếu nhân vật vừa respawn
 				local _, _, curHrp = getCharacterAndRoot()
-				if curHrp and not currentOriginPos then
-					currentOriginPos = curHrp.Position
+				if curHrp then
+					if not currentOriginPos then
+						currentOriginPos = curHrp.Position
+					end
+					if type(currentFlightY) ~= "number" then
+						currentFlightY = curHrp.Position.Y
+					end
 				end
 
 				syncHotbarSelection(myRunId, false)
-				teleportVerticalStep(currentOriginPos, myRunId)
+				flyUpwardByCFrameStep(currentOriginPos, dt, myRunId)
 			end
 		end
 	end)
@@ -842,10 +974,19 @@ trackConnection(LocalPlayer.CharacterAdded:Connect(function()
 		lastEquippedItem = nil
 		task.wait(0.2)
 		local _, _, hrp = getCharacterAndRoot()
-		if hrp and not currentOriginPos then
-			currentOriginPos = hrp.Position
+		if hrp then
+			pcall(function()
+				hrp.Anchored = false
+			end)
+			if not currentOriginPos then
+				currentOriginPos = hrp.Position
+			end
+			currentFlightY = hrp.Position.Y
 		end
 		syncHotbarSelection(Runtime.autoFarmRunId, true)
+	elseif not Config.autoFarm and isCharacterAnchoredForStop then
+		task.wait(0.2)
+		setCharacterAnchoredState(true)
 	end
 end))
 
@@ -1291,6 +1432,9 @@ local function applyConfigToUIAndLogic(silentAutoLoad)
 	isLoading = true
 	local okWrap, errWrap = pcall(function()
 		-- Cập nhật UI elements theo Config
+		if Elements.flySpeed then
+			pcall(function() Elements.flySpeed:Set(tostring(Config.flySpeed or 100)) end)
+		end
 		if Elements.item then
 			pcall(function() Elements.item:Set({ Config.item }) end)
 		end
@@ -1314,6 +1458,8 @@ local function applyConfigToUIAndLogic(silentAutoLoad)
 		end
 
 		-- Áp dụng trực tiếp logic trạng thái sau khi gán UI
+		resetTextboxCycle(false)
+
 		if Config.detectClick then
 			createDetectClickMiniGui()
 		else
@@ -1416,7 +1562,7 @@ local AutoFarmTab = Window:CreateTab("Auto Farm", nil)
 local SettingTab = Window:CreateTab("Setting", nil)
 
 -- ----------------------------------------------------------------------------
--- TAB 1: "AUTO FARM" (ĐÚNG 5 PHẦN TỬ THEO THỨ TỰ)
+-- TAB 1: "AUTO FARM" (ĐÚNG THỨ TỰ CÁC PHẦN TỬ)
 -- ----------------------------------------------------------------------------
 
 -- 1.1 Auto Farm — Toggle (mặc định tắt)
@@ -1432,6 +1578,32 @@ Elements.autoFarm = AutoFarmTab:CreateToggle({
 			startAutoFarm()
 		else
 			stopAutoFarm()
+		end
+	end
+})
+
+-- 1.1b Tốc độ bay — Input ngay dưới Auto Farm (nhập 100 -> 100 stud/s)
+Elements.flySpeed = AutoFarmTab:CreateInput({
+	Name = "Tốc độ bay",
+	CurrentValue = tostring(Config.flySpeed or 100),
+	PlaceholderText = "Ví dụ: 100 (100 stud/s)",
+	RemoveTextAfterFocusLost = false,
+	Flag = nil,
+	Callback = function(Text)
+		if isLoading then
+			return
+		end
+		local trimmed = string.match(tostring(Text or ""), "^%s*(.-)%s*$") or ""
+		local num = tonumber(trimmed)
+		if num and num >= 0 then
+			Config.flySpeed = num
+		else
+			notifyUser("Tốc độ bay", "Giá trị không hợp lệ (nhập số >= 0, ví dụ 100). Giữ giá trị cũ: " .. tostring(Config.flySpeed), 4)
+			if Elements.flySpeed then
+				pcall(function()
+					Elements.flySpeed:Set(tostring(Config.flySpeed))
+				end)
+			end
 		end
 	end
 })
@@ -1507,14 +1679,16 @@ Elements.clickCoordsRaw = AutoFarmTab:CreateInput({
 Elements.textboxText = AutoFarmTab:CreateInput({
 	Name = "Ghi textbox",
 	CurrentValue = tostring(Config.textboxText or ""),
-	PlaceholderText = "Để trống nếu không ghi chữ",
+	PlaceholderText = "Ví dụ: blackhole;1/earthquake/tsunami;11",
 	RemoveTextAfterFocusLost = false,
 	Flag = nil,
 	Callback = function(Text)
 		if isLoading then
 			return
 		end
-		Config.textboxText = tostring(Text or "")
+		local rawInput = tostring(Text or "")
+		Config.textboxText = rawInput
+		resetTextboxCycle(true)
 	end
 })
 
