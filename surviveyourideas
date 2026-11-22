@@ -218,6 +218,12 @@ local DEFAULT_CONFIG = {
 	-- Nhóm D: Các hệ số / giá trị logic đã ghi sẵn
 	MIN_HEIGHT = 250,
 	MAX_HEIGHT = 1250,
+	MAX_FLIGHT_HEIGHT = 2500,
+	MATCH_CLICK_X = 607,
+	MATCH_CLICK_Y = 66,
+	MATCH_CLICK_INITIAL_DELAY = 7.5,
+	MATCH_CLICK_INTERVAL = 5.0,
+	MATCH_CLICK_MAX_COUNT = 3,
 	TELEPORT_INTERVAL = 0.75,
 	LOCK_RADIUS_STUD = 5,
 	DETECT_TIMEOUT = 2.0,
@@ -370,7 +376,7 @@ ensureCharacterReady()
 -- [ KHU VỰC 3.5: XÁC NHẬN LOBBY (PLACEID 77900175935766) & VÁN GAME (PLACEID 109001332046330) ]
 -- ============================================================================
 -- Xác nhận lobby chỉ dựa vào PlaceId == 77900175935766 (lúc đó mới tự click toạ độ đã nêu và đóng băng Auto Farm).
--- Xác nhận ván game chỉ dựa vào PlaceId == 109001332046330 (lúc đó mới huỷ đóng băng Auto Farm).
+-- Xác nhận ván game chỉ dựa vào PlaceId == 109001332046330 (lúc đó mới huỷ đóng băng Auto Farm và click 607;66 sau 7.5s trong 3 lần, mỗi lần cách nhau 5s).
 local function getCurrentPlaceIdNumber()
 	return tonumber(game.PlaceId) or 0
 end
@@ -416,7 +422,9 @@ local ServerState = {
 	lastPlaceId = initialPlaceId,
 	isLobbyFrozen = initialIsLobby,
 	lobbyClickSessionId = 0,
-	lobbyClicksDone = 0
+	lobbyClicksDone = 0,
+	matchClickSessionId = 0,
+	matchClicksDone = 0
 }
 
 savePersistedServerState(ServerState.lastPlaceId, ServerState.isLobbyFrozen)
@@ -430,11 +438,70 @@ local function clickAtLobbyCoordsOnce()
 	end
 	local lx = tonumber(Config.LOBBY_CLICK_X) or 328
 	local ly = tonumber(Config.LOBBY_CLICK_Y) or 265
-	local hold = tonumber(Config.CLICK_HOLD) or 0.05
+	local hold = tonumber(Config.CLICK_HOLD) or 0.06
 	pcall(function()
 		VirtualInputManager:SendMouseButtonEvent(lx, ly, 0, true, game, 1)
 		task.wait(hold)
 		VirtualInputManager:SendMouseButtonEvent(lx, ly, 0, false, game, 1)
+	end)
+end
+
+local function clickAtMatchCoordsOnce()
+	if not VirtualInputManager then
+		return
+	end
+	if not isGamePlaceId(getCurrentPlaceIdNumber()) then
+		return
+	end
+	local mx = tonumber(Config.MATCH_CLICK_X) or 607
+	local my = tonumber(Config.MATCH_CLICK_Y) or 66
+	local hold = tonumber(Config.CLICK_HOLD) or 0.06
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(mx, my, 0, true, game, 1)
+		task.wait(hold)
+		VirtualInputManager:SendMouseButtonEvent(mx, my, 0, false, game, 1)
+	end)
+end
+
+local function startMatchClickSequence()
+	if not isGamePlaceId(getCurrentPlaceIdNumber()) then
+		return
+	end
+	ServerState.matchClickSessionId = (ServerState.matchClickSessionId or 0) + 1
+	local myMatchSession = ServerState.matchClickSessionId
+	ServerState.matchClicksDone = 0
+
+	task.spawn(function()
+		local initialDelay = tonumber(Config.MATCH_CLICK_INITIAL_DELAY) or 7.5
+		local maxClicks = tonumber(Config.MATCH_CLICK_MAX_COUNT) or 3
+		local interval = tonumber(Config.MATCH_CLICK_INTERVAL) or 5.0
+
+		local elapsedInit = 0
+		while elapsedInit < initialDelay do
+			if not isGamePlaceId(getCurrentPlaceIdNumber()) or ServerState.matchClickSessionId ~= myMatchSession then
+				return
+			end
+			local dt = task.wait(math.min(0.1, initialDelay - elapsedInit))
+			elapsedInit += (dt or 0.1)
+		end
+
+		while isGamePlaceId(getCurrentPlaceIdNumber()) and ServerState.matchClickSessionId == myMatchSession and ServerState.matchClicksDone < maxClicks do
+			clickAtMatchCoordsOnce()
+			ServerState.matchClicksDone += 1
+
+			if ServerState.matchClicksDone >= maxClicks or not isGamePlaceId(getCurrentPlaceIdNumber()) or ServerState.matchClickSessionId ~= myMatchSession then
+				break
+			end
+
+			local elapsed = 0
+			while elapsed < interval do
+				if not isGamePlaceId(getCurrentPlaceIdNumber()) or ServerState.matchClickSessionId ~= myMatchSession then
+					return
+				end
+				local dt = task.wait(math.min(0.1, interval - elapsed))
+				elapsed += (dt or 0.1)
+			end
+		end
 	end)
 end
 
@@ -472,6 +539,8 @@ end
 
 local function enterLobbyFrozenState(reasonText)
 	ServerState.isLobbyFrozen = true
+	ServerState.matchClickSessionId = (ServerState.matchClickSessionId or 0) + 1
+	ServerState.matchClicksDone = 0
 	savePersistedServerState(ServerState.lastPlaceId, true)
 	startLobbyClickSequence()
 	if reasonText then
@@ -484,6 +553,7 @@ local function exitLobbyFrozenState(reasonText)
 	savePersistedServerState(ServerState.lastPlaceId, false)
 	ServerState.lobbyClickSessionId = (ServerState.lobbyClickSessionId or 0) + 1
 	ServerState.lobbyClicksDone = 0
+	startMatchClickSequence()
 	if reasonText then
 		notifyUser("Vào ván game", reasonText, 4)
 	end
@@ -494,7 +564,7 @@ local function applyPlaceIdState(placeIdNum)
 	if isLobbyPlaceId(placeIdNum) then
 		enterLobbyFrozenState("Đã xác nhận PlaceId lobby (" .. tostring(placeIdNum) .. "). Đóng băng Auto Farm và tự click 328;265 mỗi 5s (tối đa 3 lần).")
 	elseif isGamePlaceId(placeIdNum) then
-		exitLobbyFrozenState("Đã xác nhận PlaceId ván game (" .. tostring(placeIdNum) .. "). Đã huỷ đóng băng Auto Farm.")
+		exitLobbyFrozenState("Đã xác nhận PlaceId ván game (" .. tostring(placeIdNum) .. "). Đã huỷ đóng băng Auto Farm và lên lịch click 607;66 sau 7.5s (3 lần, cách 5s).")
 	else
 		savePersistedServerState(placeIdNum, ServerState.isLobbyFrozen)
 	end
@@ -509,6 +579,7 @@ do
 		startLobbyClickSequence()
 	elseif initialIsGame then
 		ServerState.isLobbyFrozen = false
+		startMatchClickSequence()
 	end
 
 	task.spawn(function()
@@ -533,6 +604,7 @@ local lastEquippedItem = nil
 local lastItemCheckClock = 0
 local currentFlightY = nil
 local isCharacterAnchoredForStop = false
+local isCeilingAnchored = false
 
 local function setCharacterAnchoredState(anchored)
 	local char, _, hrp = getCharacterAndRoot()
@@ -588,7 +660,7 @@ local function sendHotbarKeyPress(itemStr)
 	local keyCode = resolveKeyCodeFromItem(itemStr)
 	local ok = pcall(function()
 		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-		task.wait(Config.CLICK_HOLD or 0.05)
+		task.wait(Config.CLICK_HOLD or 0.06)
 		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
 	end)
 	return ok
@@ -630,7 +702,7 @@ local function syncHotbarSelection(runId, forcePress)
 	end
 end
 
--- Bay thẳng đứng lên trời bằng CFrame theo vận tốc (stud/s) phụ thuộc vào Config.flySpeed
+-- Bay thẳng đứng lên trời bằng CFrame theo vận tốc (stud/s) phụ thuộc vào Config.flySpeed, giới hạn trần độ cao 2500 rồi Anchor HRP
 local function flyUpwardByCFrameStep(originPos, dt, runId)
 	if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
 		return false
@@ -640,23 +712,44 @@ local function flyUpwardByCFrameStep(originPos, dt, runId)
 		return false
 	end
 
+	local ceilingY = tonumber(Config.MAX_FLIGHT_HEIGHT) or 2500
+	if isCeilingAnchored then
+		pcall(function()
+			hrp.CFrame = CFrame.new(originPos.X, ceilingY, originPos.Z)
+			hrp.Anchored = true
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+		return true
+	end
+
 	local speedStudPerSec = tonumber(Config.flySpeed)
 	if not speedStudPerSec or speedStudPerSec < 0 then
 		speedStudPerSec = tonumber(DEFAULT_CONFIG.flySpeed) or 100
 	end
 
 	if type(currentFlightY) ~= "number" then
-		currentFlightY = hrp.Position.Y
+		currentFlightY = math.min(hrp.Position.Y, ceilingY)
 	end
 
 	local deltaY = speedStudPerSec * math.max(0, tonumber(dt) or 0)
-	currentFlightY = currentFlightY + deltaY
+	local nextY = currentFlightY + deltaY
+	local reachedCeiling = false
+	if nextY >= ceilingY then
+		nextY = ceilingY
+		reachedCeiling = true
+	end
+	currentFlightY = nextY
 
 	local ok = pcall(function()
 		hrp.Anchored = false
 		hrp.CFrame = CFrame.new(originPos.X, currentFlightY, originPos.Z)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
+		if reachedCeiling then
+			isCeilingAnchored = true
+			hrp.Anchored = true
+		end
 	end)
 	return ok
 end
@@ -936,6 +1029,7 @@ local function stopAutoFarm()
 	local originToRestore = currentOriginPos
 	currentOriginPos = nil
 	currentFlightY = nil
+	isCeilingAnchored = false
 	lastEquippedItem = nil
 	isBusy = false
 	resetTextboxCycle(false)
@@ -949,6 +1043,7 @@ local function startAutoFarm()
 	lastEquippedItem = nil
 	lastItemCheckClock = 0
 	currentFlightY = nil
+	isCeilingAnchored = false
 	isCharacterAnchoredForStop = false
 	resetTextboxCycle(true)
 
@@ -959,13 +1054,13 @@ local function startAutoFarm()
 		return
 	end
 
-	-- Gỡ Anchor nếu trước đó tắt Auto Farm trong ván game bị khoá cơ thể
+	-- Gỡ Anchor nếu trước đó tắt Auto Farm trong ván game bị khoá cơ thể hoặc đang neo ở trần
 	pcall(function()
 		hrp.Anchored = false
 	end)
 
 	currentOriginPos = hrp.Position
-	currentFlightY = hrp.Position.Y
+	currentFlightY = math.min(hrp.Position.Y, tonumber(Config.MAX_FLIGHT_HEIGHT) or 2500)
 
 	-- Nếu đang ở server lobby (PlaceId 77900175935766) thì đóng băng Auto Farm
 	if ServerState.isLobbyFrozen then
@@ -976,7 +1071,7 @@ local function startAutoFarm()
 	-- Bấm phím chọn đồ 1 lần ngay khi bật Auto Farm
 	syncHotbarSelection(myRunId, true)
 
-	-- Luồng 1: Bay lên trời bằng CFrame liên tục theo vận tốc (stud/s) + kiểm tra định kỳ cầm đồ
+	-- Luồng 1: Bay lên trời bằng CFrame liên tục theo vận tốc (stud/s) tới trần 2500 rồi anchor HRP + kiểm tra định kỳ cầm đồ
 	task.spawn(function()
 		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
 			local dt = RunService.Heartbeat:Wait()
@@ -991,7 +1086,7 @@ local function startAutoFarm()
 						currentOriginPos = curHrp.Position
 					end
 					if type(currentFlightY) ~= "number" then
-						currentFlightY = curHrp.Position.Y
+						currentFlightY = math.min(curHrp.Position.Y, tonumber(Config.MAX_FLIGHT_HEIGHT) or 2500)
 					end
 				end
 
@@ -1019,6 +1114,7 @@ end
 trackConnection(LocalPlayer.CharacterAdded:Connect(function()
 	if Config.autoFarm and not ServerState.isLobbyFrozen then
 		lastEquippedItem = nil
+		isCeilingAnchored = false
 		task.wait(0.2)
 		local _, _, hrp = getCharacterAndRoot()
 		if hrp then
@@ -1028,7 +1124,7 @@ trackConnection(LocalPlayer.CharacterAdded:Connect(function()
 			if not currentOriginPos then
 				currentOriginPos = hrp.Position
 			end
-			currentFlightY = hrp.Position.Y
+			currentFlightY = math.min(hrp.Position.Y, tonumber(Config.MAX_FLIGHT_HEIGHT) or 2500)
 		end
 		syncHotbarSelection(Runtime.autoFarmRunId, true)
 	elseif not Config.autoFarm and isCharacterAnchoredForStop then
@@ -1328,6 +1424,7 @@ local function buildAutoExecLoaderCode()
 pcall(function()
 	if not game:IsLoaded() then game.Loaded:Wait() end
 	local HttpService = game:GetService("HttpService")
+	local VirtualInputManager = pcall(function() return game:GetService("VirtualInputManager") end) and game:GetService("VirtualInputManager")
 	local env = getgenv()
 	env.__AutoFarmHub_Runtime_State__ = env.__AutoFarmHub_Runtime_State__ or {}
 	local rt = env.__AutoFarmHub_Runtime_State__
@@ -1357,6 +1454,26 @@ pcall(function()
 		if okEnc and type(enc) == "string" then
 			pcall(writefile, "AutoFarmHub/server_transition_state.json", enc)
 		end
+	end
+	if curPlaceId == gamePlaceId and VirtualInputManager then
+		rt.preMatchClickToken = (tonumber(rt.preMatchClickToken) or 0) + 1
+		local myToken = rt.preMatchClickToken
+		task.spawn(function()
+			task.wait(7.5)
+			for i = 1, 3 do
+				if tonumber(game.PlaceId) ~= gamePlaceId or rt.preMatchClickToken ~= myToken then
+					return
+				end
+				pcall(function()
+					VirtualInputManager:SendMouseButtonEvent(607, 66, 0, true, game, 1)
+					task.wait(0.06)
+					VirtualInputManager:SendMouseButtonEvent(607, 66, 0, false, game, 1)
+				end)
+				if i < 3 then
+					task.wait(5.0)
+				end
+			end
+		end)
 	end
 end)
 ]=]
