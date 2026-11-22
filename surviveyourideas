@@ -222,11 +222,13 @@ local DEFAULT_CONFIG = {
 	LOCK_RADIUS_STUD = 5,
 	DETECT_TIMEOUT = 2.0,
 	POLL_STEP = 0.05,
-	PRE_FILL_DELAY = 0.1,
-	POST_SET_DELAY = 0.05,
-	CLICK_HOLD = 0.05,
-	CHAR_DELAY = 0.02,
-	CLICK_LOOP_DELAY = 0.08,
+	PRE_FILL_DELAY = 0.15,
+	POST_SET_DELAY = 0.12,
+	CLICK_HOLD = 0.06,
+	CHAR_DELAY = 0.06,
+	CLICK_LOOP_DELAY = 0.65,
+	TEXTBOX_CYCLE_COOLDOWN = 1.2,
+	TEXTBOX_CLOSE_WAIT = 2.0,
 	ITEM_KEY_MAP = {
 		["1"] = Enum.KeyCode.One.Name,
 		["2"] = Enum.KeyCode.Two.Name,
@@ -677,12 +679,13 @@ local function applyStopState(originPos)
 end
 
 -- ============================================================================
--- [ KHU VỰC 5: LOGIC PHÁT HIỆN & GHI TEXTBOX (CHUỖI TỪ;SỐ / TỪ THEO VÒNG LẶP) ]
+-- [ KHU VỰC 5: LOGIC PHÁT HIỆN & GHI TEXTBOX (TỪ TỐN TỪNG TỪ, CHỐNG GHI ĐÈ) ]
 -- ============================================================================
 local isBusy = false
 local textboxCycleEntries = {}
 local textboxCycleRawParsed = nil
 local textboxCycleInvalid = false
+local lastTextboxCommitClock = 0
 
 -- Kiểm tra và tách chuỗi ghi textbox hợp lệ dạng mục1/mục2/...
 -- Hợp lệ: từng mục là <từ không chứa khoảng trắng, ;, /> hoặc <từ>;<số nguyên >= 1>
@@ -741,6 +744,7 @@ local function resetTextboxCycle(notifyIfInvalid)
 	textboxCycleRawParsed = rawStr
 	textboxCycleInvalid = isInvalid == true
 	textboxCycleEntries = (type(parsed) == "table") and parsed or {}
+	lastTextboxCommitClock = 0
 
 	if isInvalid and notifyIfInvalid then
 		notifyUser("Ghi textbox", "Chuỗi không hợp lệ (" .. rawStr .. "). Dùng dạng từ hoặc từ;số ngăn cách bằng dấu / (ví dụ: blackhole;1/earthquake/tsunami;11).", 5)
@@ -748,7 +752,7 @@ local function resetTextboxCycle(notifyIfInvalid)
 	return isValidPattern
 end
 
-local function takeNextTextboxWordFromCycle()
+local function peekNextTextboxWordFromCycle()
 	local rawStr = tostring(Config.textboxText or "")
 	if rawStr == "" then
 		return nil
@@ -762,14 +766,20 @@ local function takeNextTextboxWordFromCycle()
 
 	for _, entry in ipairs(textboxCycleEntries) do
 		if entry.maxCount == nil then
-			return entry.text
+			return entry.text, entry
 		elseif entry.usedCount < entry.maxCount then
-			entry.usedCount += 1
-			return entry.text
+			return entry.text, entry
 		end
 	end
 
-	return nil
+	return nil, nil
+end
+
+local function commitTextboxWordEntry(entry)
+	if entry and entry.maxCount ~= nil and entry.usedCount < entry.maxCount then
+		entry.usedCount += 1
+	end
+	lastTextboxCommitClock = os.clock()
 end
 
 -- Lấy TextBox đang mở/được chọn (theo code tham chiếu)
@@ -792,13 +802,28 @@ local function isKeyboardOrBoxOpen()
 	return kb == true
 end
 
+local function waitForKeyboardOrBoxClose(runId)
+	local maxWait = tonumber(Config.TEXTBOX_CLOSE_WAIT) or 2.0
+	local pollStep = tonumber(Config.POLL_STEP) or 0.05
+	local t0 = os.clock()
+	while (os.clock() - t0) < maxWait do
+		if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+			return
+		end
+		if not isKeyboardOrBoxOpen() then
+			return
+		end
+		task.wait(pollStep)
+	end
+end
+
 local function fillActiveBox(text)
 	local box = getActiveTextBox()
 	if box then
 		pcall(function()
 			box.Text = text
 		end)
-		task.wait(Config.POST_SET_DELAY or 0.05)
+		task.wait(Config.POST_SET_DELAY or 0.12)
 		-- Ghi đè thêm 1 lần nếu game có script reset lại lúc mới focus
 		pcall(function()
 			if box.Text ~= text then
@@ -809,14 +834,15 @@ local function fillActiveBox(text)
 		return true
 	end
 
-	-- Dự phòng nếu không bắt được instance TextBox nhưng bàn phím ảo đã mở
+	-- Dự phòng nếu không bắt được instance TextBox nhưng bàn phím ảo đã mở: gõ từ tốn từng ký tự
 	if VirtualInputManager then
+		local charDelay = tonumber(Config.CHAR_DELAY) or 0.06
 		for i = 1, #text do
 			local ch = string.sub(text, i, i)
 			pcall(function()
 				VirtualInputManager:SendTextInputCharacterEvent(ch, game)
 			end)
-			task.wait(Config.CHAR_DELAY or 0.02)
+			task.wait(charDelay)
 		end
 		return true
 	end
@@ -824,7 +850,7 @@ local function fillActiveBox(text)
 	return false
 end
 
--- Một lượt click toạ độ (và nếu chuỗi ghi textbox hợp lệ và còn lượt thì chờ phát hiện tối đa 2.0s rồi điền)
+-- Một lượt click toạ độ: chỉ khi ô nhập/bàn phím thực sự bật lên mới ghi từ tốn 1 từ rồi chờ đóng hẳn và nghỉ nhịp
 local function clickTargetAndTypeOnce(runId)
 	if isBusy then
 		return
@@ -837,7 +863,24 @@ local function clickTargetAndTypeOnce(runId)
 	local targetX = tonumber(Config.clickX) or 380
 	local targetY = tonumber(Config.clickY) or 172
 	local rawTextPattern = tostring(Config.textboxText or "")
-	local holdTime = Config.CLICK_HOLD or 0.05
+	local holdTime = Config.CLICK_HOLD or 0.06
+
+	-- Giãn nhịp giữa các lần ghi chữ để không bị từ sau ghi đè lên từ trước chưa kịp thấy
+	if rawTextPattern ~= "" and lastTextboxCommitClock > 0 then
+		local cooldown = tonumber(Config.TEXTBOX_CYCLE_COOLDOWN) or 1.2
+		local elapsedSinceCommit = os.clock() - lastTextboxCommitClock
+		if elapsedSinceCommit < cooldown then
+			local remain = cooldown - elapsedSinceCommit
+			local tWait = os.clock()
+			while (os.clock() - tWait) < remain do
+				if not Config.autoFarm or ServerState.isLobbyFrozen or Runtime.autoFarmRunId ~= runId then
+					isBusy = false
+					return
+				end
+				task.wait(math.min(0.05, remain - (os.clock() - tWait)))
+			end
+		end
+	end
 
 	-- 1. Click vào toạ độ đã nhập
 	if VirtualInputManager then
@@ -848,9 +891,9 @@ local function clickTargetAndTypeOnce(runId)
 		end)
 	end
 
-	-- 2. Nếu ô Ghi textbox không rỗng: lấy từ tiếp theo theo vòng lặp và chờ tối đa DETECT_TIMEOUT (2.0s)
+	-- 2. Nếu ô Ghi textbox không rỗng: chỉ khi TextBox / bàn phím ảo bật lên mới ghi 1 từ từ tốn cho lần mở này
 	if rawTextPattern ~= "" then
-		local textToType = takeNextTextboxWordFromCycle()
+		local textToType, targetEntry = peekNextTextboxWordFromCycle()
 		if textToType and textToType ~= "" then
 			local detected = false
 			local timeout = Config.DETECT_TIMEOUT or 2.0
@@ -867,10 +910,14 @@ local function clickTargetAndTypeOnce(runId)
 				task.wait(pollStep)
 			end
 
-			-- 3. Nếu phát hiện bật lên thì chờ PRE_FILL_DELAY (0.1s) rồi tự điền chuỗi
+			-- 3. Khi phát hiện ô nhập bật lên: chờ ngắn rồi điền đúng 1 từ từ tốn, trừ 1 lượt và chờ ô đóng hẳn
 			if detected and Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
-				task.wait(Config.PRE_FILL_DELAY or 0.1)
-				fillActiveBox(textToType)
+				task.wait(Config.PRE_FILL_DELAY or 0.15)
+				if Config.autoFarm and not ServerState.isLobbyFrozen and Runtime.autoFarmRunId == runId then
+					fillActiveBox(textToType)
+					commitTextboxWordEntry(targetEntry)
+					waitForKeyboardOrBoxClose(runId)
+				end
 			end
 		end
 	end
@@ -954,7 +1001,7 @@ local function startAutoFarm()
 		end
 	end)
 
-	-- Luồng 2: Click toạ độ liên tục + phát hiện/ghi textbox khi Auto Farm bật (và không bị đóng băng ở lobby)
+	-- Luồng 2: Click toạ độ từ tốn + phát hiện/ghi từng từ một khi Auto Farm bật (và không bị đóng băng ở lobby)
 	task.spawn(function()
 		while Config.autoFarm and Runtime.autoFarmRunId == myRunId do
 			if not ServerState.isLobbyFrozen then
@@ -963,7 +1010,7 @@ local function startAutoFarm()
 			if not Config.autoFarm or Runtime.autoFarmRunId ~= myRunId then
 				return
 			end
-			task.wait(Config.CLICK_LOOP_DELAY or 0.08)
+			task.wait(Config.CLICK_LOOP_DELAY or 0.65)
 		end
 	end)
 end
